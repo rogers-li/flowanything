@@ -1,0 +1,102 @@
+{
+  "root_node":"a1",
+  "nodes": {
+    "a1":{
+      "node_type" : "debug",
+      "node_id" : "a1",
+      "node_data" : {
+        "print_text" : "start flow"
+      },
+      "downstream" : {"to_node_id": "a2"}
+    },
+    "a2":{
+      "node_type" : "exclusive_gateway",
+      "node_id" : "a2",
+      "node_data" : {
+        "conditions": [
+          {
+            "expression" : "a==1",
+            "downstream" : {
+              "to_node_id" : "a2.1"
+            },
+            "assign" : [
+              {
+                "assign_expression" : "a2_choose_path='a2.1'"
+              }
+            ]
+          },
+          {
+            "expression" : "a==2",
+            "downstream" : {
+              "to_node_id" : "a2.2"
+            },
+            "assign" : [
+              {
+                "assign_expression" : "a2_choose_path='a2.2'"
+              }
+            ]
+          }
+        ],
+        "default_condition" : {
+          "expression" : "a==1",
+          "downstream" : {
+            "to_node_id" : "a2.1"
+          },
+          "assign" : [
+            {
+              "assign_expression" : "a2_choose_path='default'"
+            }
+          ]
+        }
+      }
+    },
+    "a2.1":{
+      "node_type" : "debug",
+      "node_id" : "a2.1",
+      "node_data" : {
+        "print_text" : "a2.1"
+      },
+      "downstream" : {"to_node_id": "a2.2"}
+    },
+    "a2.2":{
+      "node_type" : "parallel_gateway",
+      "node_id" : "a2.2",
+      "node_data" : {
+        "upstream" : [{"from_node_id": "a2.1"}],
+        "downstream" : [{"to_node_id": "a2.2-1"},{"to_node_id": "a2.2-2"}]
+      }
+    },
+    "a2.2-1":{
+      "node_type" : "debug",
+      "node_id" : "a2.2-1",
+      "node_data" : {
+        "print_text" : "a2.2-1"
+      },
+      "downstream" : {"to_node_id": "a3"}
+    },
+    "a2.2-2":{
+      "node_type" : "debug",
+      "node_id" : "a2.2-2",
+      "node_data" : {
+        "print_text" : "a2.2-2"
+      },
+      "downstream" : {"to_node_id": "a3"}
+    },
+    "a3":{
+      "node_type" : "parallel_gateway",
+      "node_id" : "a3",
+      "node_data" : {
+        "downstream" : [{"to_node_id": "a4"}],
+        "upstream" : [{"from_node_id": "a2.2-1"},{"from_node_id": "a2.2-2"}]
+      }
+    },
+    "a4":{
+      "node_type" : "debug",
+      "node_id" : "a4",
+      "node_data" : {
+        "print_text" : "a4"
+      },
+      "downstream" : {"to_node_id": ""}
+    }
+  }
+}
