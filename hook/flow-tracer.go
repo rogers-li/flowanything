@@ -4,6 +4,7 @@ import (
 	"flow-anything/eventbus"
 	"flow-anything/fastflow"
 	"fmt"
+	"time"
 )
 
 type FlowTracer struct {
@@ -38,12 +39,12 @@ func (f *FlowTracer) printEvent(e eventbus.Event) {
 	if e.EventType == fastflow.EventTypeNodeCompleted {
 		eventData := e.EventData.(fastflow.FlowEventData)
 		data := eventData.EventData.(fastflow.NodeCompleteEventData)
-		fmt.Printf("trace: event[%s] node_id[%s]\n", e.EventType, data.NodeId)
+		fmt.Printf("trace: event[%s] node_id[%s] time[%s]\n", e.EventType, data.NodeId, time.Now().Format("2000-01-01 00:00:00"))
 	} else if e.EventType == fastflow.EventTypeNextNode {
 		eventData := e.EventData.(fastflow.FlowEventData)
 		data := eventData.EventData.(fastflow.NextNodeEventData)
-		fmt.Printf("trace: event[%s] from_node_id[%s] to_node_id[%s]\n", e.EventType, data.FromNodeId, data.NextNodeId)
+		fmt.Printf("trace: event[%s] from_node_id[%s] to_node_id[%s] time[%s]\n", e.EventType, data.FromNodeId, data.NextNodeId, time.Now().Format("2000-01-01 00:00:00"))
 	} else {
-		fmt.Printf("trace: %s\n", e.EventType)
+		fmt.Printf("trace: %s time[%s]\n", e.EventType, time.Now().Format("2000-01-01 00:00:00"))
 	}
 }

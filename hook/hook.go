@@ -31,6 +31,7 @@ type EventDelivery interface {
 type Hook struct {
 	EventWatcher
 	EventDelivery
+	eventbus.Subscriber
 }
 
 func NewEventHook(watcher EventWatcher, delivery EventDelivery) *Hook {
