@@ -89,3 +89,27 @@ func ToString(in interface{}) string {
 	}
 	return ""
 }
+
+func IsEmptyVal(in interface{}) bool {
+	if numberVal, ok := in.(json.Number); ok {
+		in, _ = DetectJsonNUmberAuto(numberVal)
+	}
+	switch in.(type) {
+	case int:
+		return in.(int) == 0
+	case int64:
+		return in.(int64) == 0
+	case float64:
+		return in.(float64) == 0
+	case string:
+		return in.(string) == ""
+	}
+	return false
+}
+
+func DetectJsonNUmberAuto(in json.Number) (interface{}, error) {
+	if strings.Contains(in.String(), ".") {
+		return in.Float64()
+	}
+	return in.Int64()
+}
