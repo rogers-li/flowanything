@@ -10,10 +10,12 @@ import (
 
 // Runner wires model, capability registry, strategy registry, and event hooks.
 type Runner struct {
-	model        ModelClient
-	capabilities CapabilityRegistry
-	strategies   *StrategyRegistry
-	hooks        []AgentEventHook
+	model            ModelClient
+	capabilities     CapabilityRegistry
+	strategies       *StrategyRegistry
+	contextAssembler ContextAssembler
+	memory           MemoryProvider
+	hooks            []AgentEventHook
 }
 
 type RunnerOption func(*Runner)
@@ -24,6 +26,18 @@ func WithCapabilities(registry CapabilityRegistry) RunnerOption {
 
 func WithStrategies(registry *StrategyRegistry) RunnerOption {
 	return func(r *Runner) { r.strategies = registry }
+}
+
+func WithContextAssembler(assembler ContextAssembler) RunnerOption {
+	return func(r *Runner) {
+		if assembler != nil {
+			r.contextAssembler = assembler
+		}
+	}
+}
+
+func WithMemoryProvider(provider MemoryProvider) RunnerOption {
+	return func(r *Runner) { r.memory = provider }
 }
 
 func WithEventHook(hook AgentEventHook) RunnerOption {
@@ -48,9 +62,10 @@ func WithEventSink(sink AgentEventHook) RunnerOption {
 
 func NewRunner(model ModelClient, opts ...RunnerOption) *Runner {
 	runner := &Runner{
-		model:        model,
-		capabilities: NewMapCapabilityRegistry(),
-		strategies:   NewDefaultStrategyRegistry(),
+		model:            model,
+		capabilities:     NewMapCapabilityRegistry(),
+		strategies:       NewDefaultStrategyRegistry(),
+		contextAssembler: NewDefaultContextAssembler(),
 	}
 	for _, opt := range opts {
 		opt(runner)
@@ -62,10 +77,11 @@ func (r *Runner) Run(ctx Context, req AgentRunRequest) (AgentRunResult, error) {
 	if r.model == nil {
 		return AgentRunResult{}, fmt.Errorf("model client is required")
 	}
-	if req.Agent.ID == "" {
-		return AgentRunResult{}, fmt.Errorf("agent id is required")
+	if err := validateAgentSpec(req.Agent); err != nil {
+		return AgentRunResult{}, err
 	}
 	ctx, req = prepareAgentTraceContext(ctx, req)
+	req.Agent.Policy = normalizeAgentPolicy(req.Agent.Policy)
 	mode := req.Agent.ReasoningMode
 	if mode == "" {
 		mode = DirectStrategy{}.Name()
@@ -77,9 +93,11 @@ func (r *Runner) Run(ctx Context, req AgentRunRequest) (AgentRunResult, error) {
 
 	r.publish(ctx, req, AgentEvent{Type: EventAgentStarted, Strategy: strategy.Name()})
 	result, err := strategy.Run(ctx, StrategyRuntime{
-		Model:        r.model,
-		Capabilities: r.capabilities,
-		Events:       agentEventPublisher{hooks: r.hooks, traceContext: req.TraceContext},
+		Model:            r.model,
+		Capabilities:     r.capabilities,
+		ContextAssembler: r.contextAssembler,
+		Memory:           r.memory,
+		Events:           agentEventPublisher{hooks: r.hooks, traceContext: req.TraceContext},
 	}, req)
 	if err != nil {
 		r.publish(ctx, req, AgentEvent{Type: EventAgentFailed, Strategy: strategy.Name(), Error: err.Error()})
@@ -130,9 +148,11 @@ func newAgentEvent(req AgentRunRequest, eventType AgentEventType, data map[strin
 
 // StrategyRuntime provides controlled access to dependencies from strategies.
 type StrategyRuntime struct {
-	Model        ModelClient
-	Capabilities CapabilityRegistry
-	Events       AgentEventPublisher
+	Model            ModelClient
+	Capabilities     CapabilityRegistry
+	ContextAssembler ContextAssembler
+	Memory           MemoryProvider
+	Events           AgentEventPublisher
 }
 
 func prepareAgentTraceContext(ctx Context, req AgentRunRequest) (Context, AgentRunRequest) {
@@ -177,6 +197,9 @@ func normalizeAgentEventTraceContext(event AgentEvent, agentTrace runtimecontext
 		traceContext.ParentSpanID = agentTrace.SpanID
 	case EventCapabilityStarted, EventCapabilityCompleted, EventCapabilityFailed:
 		traceContext.SpanID = runtimecontext.AgentCapabilitySpanID(traceContext.TraceID, event.AgentID, event.CapabilityType, event.CapabilityID)
+		traceContext.ParentSpanID = agentTrace.SpanID
+	case EventContextAssembled, EventContextFailed:
+		traceContext.SpanID = runtimecontext.AgentModelSpanID(traceContext.TraceID, event.AgentID, "context")
 		traceContext.ParentSpanID = agentTrace.SpanID
 	case EventFinalAnswerStarted, EventFinalAnswerCompleted, EventFinalAnswerFailed:
 		traceContext.SpanID = runtimecontext.AgentFinalAnswerSpanID(traceContext.TraceID, event.AgentID)

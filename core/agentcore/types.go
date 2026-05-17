@@ -1,6 +1,9 @@
 package agentcore
 
-import "flow-anything/core/runtimecontext"
+import (
+	"flow-anything/core/runtimecontext"
+	"flow-anything/core/schema"
+)
 
 // AgentSpec is the runtime definition consumed by Agent Core.
 type AgentSpec struct {
@@ -12,6 +15,7 @@ type AgentSpec struct {
 	Model         ModelConfig
 	Capabilities  []CapabilityDescriptor
 	OutputSchema  []SchemaField
+	Policy        AgentPolicy
 }
 
 // ModelConfig keeps provider-specific model settings outside the reasoning
@@ -23,14 +27,21 @@ type ModelConfig struct {
 	MaxTokens   int
 }
 
-// SchemaField describes capability and agent input/output contracts.
-type SchemaField struct {
-	Name        string
-	Type        string
-	Description string
-	Required    bool
-	Children    []SchemaField
+// AgentPolicy keeps agent execution bounded and observable. Zero values are
+// normalized by the runner so configs can stay compact.
+type AgentPolicy struct {
+	MaxIterations       int
+	MaxActions          int
+	ValidateFinalOutput bool
+	MaxContextTokens    int
+	MaxHistoryMessages  int
+	MaxMemoryItems      int
+	MaxMessageChars     int
 }
+
+// SchemaField describes capability and agent input/output contracts. The
+// concrete schema semantics live in core/schema.
+type SchemaField = schema.Field
 
 // Message is a provider-neutral chat message.
 type Message struct {

@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"flow-anything/core/runtimecontext"
+	"flow-anything/core/schema"
 )
 
 // ConnectorSpec describes how to communicate with one external system.
@@ -49,11 +50,14 @@ type OperationSpec struct {
 }
 
 type OperationRequest struct {
-	Method  string            `json:"method"`
-	Path    string            `json:"path"`
-	Headers map[string]string `json:"headers"`
-	Query   map[string]string `json:"query"`
-	Config  map[string]any    `json:"config"`
+	Method      string            `json:"method"`
+	Path        string            `json:"path"`
+	PathParams  map[string]string `json:"path_params"`
+	Headers     map[string]string `json:"headers"`
+	Query       map[string]string `json:"query"`
+	QueryParams map[string]string `json:"query_params"`
+	BodyField   string            `json:"body_field"`
+	Config      map[string]any    `json:"config"`
 }
 
 type OperationResponse struct {
@@ -71,13 +75,7 @@ type RetryPolicy struct {
 	Backoff     time.Duration `json:"backoff"`
 }
 
-type SchemaField struct {
-	Name        string        `json:"name"`
-	Type        string        `json:"type"`
-	Description string        `json:"description"`
-	Required    bool          `json:"required"`
-	Children    []SchemaField `json:"children"`
-}
+type SchemaField = schema.Field
 
 // InvokeRequest is a runtime operation invocation.
 type InvokeRequest struct {

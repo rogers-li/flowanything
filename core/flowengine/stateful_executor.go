@@ -64,6 +64,12 @@ func NewStatefulExecutor(registry *Registry, store InstanceStore, opts ...Statef
 
 // Start creates a flow instance and runs it until it blocks or completes.
 func (e *StatefulExecutor) Start(ctx context.Context, spec FlowSpec, flowInput map[string]any) (FlowInstance, error) {
+	return e.StartWithContext(ctx, spec, flowInput, NewDataContext(flowInput))
+}
+
+// StartWithContext creates a flow instance using an explicit initial context
+// and runs it until it blocks or completes.
+func (e *StatefulExecutor) StartWithContext(ctx context.Context, spec FlowSpec, flowInput map[string]any, initialContext *DataContext) (FlowInstance, error) {
 	if err := e.validate(ctx, spec); err != nil {
 		return FlowInstance{}, err
 	}
@@ -71,13 +77,19 @@ func (e *StatefulExecutor) Start(ctx context.Context, spec FlowSpec, flowInput m
 	if len(sources) == 0 {
 		return FlowInstance{}, fmt.Errorf("flow has no source node")
 	}
+	if initialContext == nil {
+		initialContext = NewDataContext(flowInput)
+	}
+	if initialContext.FlowInput == nil {
+		initialContext.FlowInput = cloneMap(flowInput)
+	}
 	now := time.Now()
 	instance := FlowInstance{
 		InstanceID:  e.instanceIDFn(),
 		FlowID:      spec.ID,
 		FlowVersion: spec.Version,
 		Status:      InstanceCreated,
-		Context:     NewDataContext(flowInput),
+		Context:     initialContext,
 		Tokens:      make([]ExecutionToken, 0, len(sources)),
 		NodeStates:  map[string]NodeState{},
 		JoinStates:  map[string]JoinState{},

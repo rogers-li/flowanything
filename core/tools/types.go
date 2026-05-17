@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"flow-anything/core/runtimecontext"
+	"flow-anything/core/schema"
 )
 
 // ToolSpec is the standard configuration protocol for one callable tool.
@@ -50,13 +51,7 @@ type RetryPolicy struct {
 	Backoff     time.Duration `json:"backoff"`
 }
 
-type SchemaField struct {
-	Name        string        `json:"name"`
-	Type        string        `json:"type"`
-	Description string        `json:"description"`
-	Required    bool          `json:"required"`
-	Children    []SchemaField `json:"children"`
-}
+type SchemaField = schema.Field
 
 // ToolCall is the runtime request to execute a tool.
 type ToolCall struct {

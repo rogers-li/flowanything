@@ -3,6 +3,8 @@ package flowengine
 import (
 	"fmt"
 	"strings"
+
+	"flow-anything/core/expression"
 )
 
 // DataContext is the runtime context shared by all nodes.
@@ -44,7 +46,7 @@ func (c *DataContext) Read(path string) (any, bool) {
 	default:
 		return nil, false
 	}
-	return readParts(current, parts)
+	return expression.ReadPath(current, strings.Join(parts, "."))
 }
 
 // Write stores value into a writable context path. FlowInput is intentionally
@@ -58,15 +60,14 @@ func (c *DataContext) Write(path string, value any) error {
 	case "flow_input", "input":
 		return fmt.Errorf("flow input is read-only")
 	case "flow_output", "output":
-		writeParts(c.FlowOutput, parts, value)
+		return expression.WritePath(c.FlowOutput, strings.Join(parts, "."), value)
 	case "variables", "vars":
-		writeParts(c.Variables, parts, value)
+		return expression.WritePath(c.Variables, strings.Join(parts, "."), value)
 	case "node_context", "node_contexts", "nodes":
-		writeParts(c.NodeContext, parts, value)
+		return expression.WritePath(c.NodeContext, strings.Join(parts, "."), value)
 	default:
 		return fmt.Errorf("unknown context root %q", root)
 	}
-	return nil
 }
 
 // ReadNodeContext reads data from a namespace owned by a node type or adapter.
@@ -80,7 +81,7 @@ func (c *DataContext) ReadNodeContext(namespace, path string) (any, bool) {
 	if !ok {
 		return nil, false
 	}
-	return readParts(namespaceData, splitFieldPath(path))
+	return expression.ReadPath(namespaceData, path)
 }
 
 // WriteNodeContext writes data to a namespace owned by a node type or adapter.
@@ -98,65 +99,15 @@ func (c *DataContext) WriteNodeContext(namespace, path string, value any) error 
 		namespaceData = map[string]any{}
 		c.NodeContext[namespace] = namespaceData
 	}
-	writeParts(namespaceData, splitFieldPath(path), value)
-	return nil
+	return expression.WritePath(namespaceData, path, value)
 }
 
 func splitPath(path string) (string, []string) {
-	path = strings.TrimSpace(path)
-	path = strings.TrimPrefix(path, "$.")
-	path = strings.TrimPrefix(path, "$")
-	path = strings.TrimPrefix(path, ".")
-	if path == "" {
+	parts := expression.SplitPath(path)
+	if len(parts) == 0 {
 		return "", nil
 	}
-	parts := strings.Split(path, ".")
 	return parts[0], parts[1:]
-}
-
-func splitFieldPath(path string) []string {
-	path = strings.TrimSpace(path)
-	path = strings.TrimPrefix(path, "$.")
-	path = strings.TrimPrefix(path, "$")
-	path = strings.TrimPrefix(path, ".")
-	if path == "" {
-		return nil
-	}
-	return strings.Split(path, ".")
-}
-
-func readParts(value any, parts []string) (any, bool) {
-	current := value
-	if len(parts) == 0 {
-		return current, true
-	}
-	for _, part := range parts {
-		asMap, ok := current.(map[string]any)
-		if !ok {
-			return nil, false
-		}
-		current, ok = asMap[part]
-		if !ok {
-			return nil, false
-		}
-	}
-	return current, true
-}
-
-func writeParts(target map[string]any, parts []string, value any) {
-	current := target
-	for i, part := range parts {
-		if i == len(parts)-1 {
-			current[part] = value
-			return
-		}
-		next, ok := current[part].(map[string]any)
-		if !ok {
-			next = map[string]any{}
-			current[part] = next
-		}
-		current = next
-	}
 }
 
 func cloneMap(source map[string]any) map[string]any {

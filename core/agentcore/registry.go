@@ -73,6 +73,7 @@ func NewDefaultStrategyRegistry() *StrategyRegistry {
 	registry := NewStrategyRegistry()
 	_ = registry.Register(DirectStrategy{})
 	_ = registry.Register(ActionPlanningStrategy{})
+	_ = registry.Register(ReActStrategy{})
 	return registry
 }
 

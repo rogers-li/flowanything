@@ -26,6 +26,8 @@ const (
 	EventCapabilityStarted    AgentEventType = "capability.started"
 	EventCapabilityCompleted  AgentEventType = "capability.completed"
 	EventCapabilityFailed     AgentEventType = "capability.failed"
+	EventContextAssembled     AgentEventType = "context.assembled"
+	EventContextFailed        AgentEventType = "context.failed"
 	EventFinalAnswerStarted   AgentEventType = "final_answer.started"
 	EventFinalAnswerCompleted AgentEventType = "final_answer.completed"
 	EventFinalAnswerFailed    AgentEventType = "final_answer.failed"

@@ -1,10 +1,8 @@
 package agentcore
 
 import (
-	"encoding/json"
-	"fmt"
-	"strings"
-
+	corecapability "flow-anything/core/capability"
+	coreprompt "flow-anything/core/prompt"
 	"flow-anything/core/runtimecontext"
 )
 
@@ -21,11 +19,13 @@ func (DirectStrategy) Run(ctx Context, runtime StrategyRuntime, req AgentRunRequ
 		ParentSpanID:  req.TraceContext.SpanID,
 		CorrelationID: req.TraceContext.CorrelationID,
 	}
+	messages, err := assembleContextMessages(ctx, runtime, req, DirectStrategy{}.Name(), ContextPhaseDirect, req.Agent.Prompt, nil, nil)
+	if err != nil {
+		return AgentRunResult{}, err
+	}
 	response, err := runtime.Model.Chat(withAgentTraceContext(ctx, modelTrace), ModelRequest{
-		Model: req.Agent.Model,
-		Messages: append([]Message{{Role: "system", Content: req.Agent.Prompt}},
-			append(req.Conversation, Message{Role: "user", Content: req.UserMessage})...,
-		),
+		Model:        req.Agent.Model,
+		Messages:     messages,
 		Metadata:     map[string]any{"phase": "direct"},
 		TraceID:      req.TraceID,
 		TraceContext: modelTrace,
@@ -34,8 +34,13 @@ func (DirectStrategy) Run(ctx Context, runtime StrategyRuntime, req AgentRunRequ
 		runtime.Events.PublishAgentEvent(ctx, strategyEvent(req, DirectStrategy{}.Name(), EventModelFailed, map[string]any{"phase": "direct"}, err.Error()))
 		return AgentRunResult{}, err
 	}
+	output, err := parseAndValidateFinalOutput(req.Agent, response.Message.Content)
+	if err != nil {
+		runtime.Events.PublishAgentEvent(ctx, strategyEvent(req, DirectStrategy{}.Name(), EventModelFailed, map[string]any{"phase": "direct", "content": response.Message.Content}, err.Error()))
+		return AgentRunResult{}, err
+	}
 	runtime.Events.PublishAgentEvent(ctx, strategyEvent(req, DirectStrategy{}.Name(), EventModelCompleted, map[string]any{"phase": "direct", "content": response.Message.Content}, ""))
-	return AgentRunResult{Text: response.Message.Content, Raw: response.Raw}, nil
+	return AgentRunResult{Text: response.Message.Content, Output: output, Raw: response.Raw}, nil
 }
 
 // ActionPlanningStrategy asks the model for an action list, invokes selected
@@ -57,12 +62,13 @@ func (ActionPlanningStrategy) Run(ctx Context, runtime StrategyRuntime, req Agen
 		ParentSpanID:  req.TraceContext.SpanID,
 		CorrelationID: req.TraceContext.CorrelationID,
 	}
+	planningMessages, err := assembleContextMessages(ctx, runtime, req, ActionPlanningStrategy{}.Name(), ContextPhasePlanning, buildPlanningPrompt(req.Agent, available), nil, nil)
+	if err != nil {
+		return AgentRunResult{}, err
+	}
 	planningResponse, err := runtime.Model.Chat(withAgentTraceContext(ctx, planningTrace), ModelRequest{
-		Model: req.Agent.Model,
-		Messages: []Message{
-			{Role: "system", Content: buildPlanningPrompt(req.Agent, available)},
-			{Role: "user", Content: req.UserMessage},
-		},
+		Model:        req.Agent.Model,
+		Messages:     planningMessages,
 		Tools:        available,
 		Metadata:     map[string]any{"phase": "planning"},
 		TraceID:      req.TraceID,
@@ -81,14 +87,30 @@ func (ActionPlanningStrategy) Run(ctx Context, runtime StrategyRuntime, req Agen
 	runtime.Events.PublishAgentEvent(ctx, strategyEvent(req, ActionPlanningStrategy{}.Name(), EventPlanningCompleted, map[string]any{"actions": plan.Actions}, ""))
 
 	if len(plan.Actions) == 0 {
-		return AgentRunResult{Text: plan.FinalAnswerIfNoAction, Raw: planningResponse.Raw}, nil
+		output, err := parseAndValidateFinalOutput(req.Agent, plan.FinalAnswerIfNoAction)
+		if err != nil {
+			runtime.Events.PublishAgentEvent(ctx, strategyEvent(req, ActionPlanningStrategy{}.Name(), EventFinalAnswerFailed, map[string]any{"content": plan.FinalAnswerIfNoAction}, err.Error()))
+			return AgentRunResult{}, err
+		}
+		return AgentRunResult{Text: plan.FinalAnswerIfNoAction, Output: output, Raw: planningResponse.Raw}, nil
 	}
 
 	actionResults := make([]ActionResult, 0, len(plan.Actions))
+	policy := normalizeAgentPolicy(req.Agent.Policy)
 	for _, action := range plan.Actions {
+		if len(actionResults) >= policy.MaxActions {
+			actionResults = append(actionResults, ActionResult{Action: action, Error: "max actions reached"})
+			break
+		}
 		capability, ok := runtime.Capabilities.Get(action.ID)
 		if !ok {
 			actionResults = append(actionResults, ActionResult{Action: action, Error: "capability not found"})
+			continue
+		}
+		descriptor := capability.Descriptor()
+		if err := validateCapabilityInput(action, descriptor); err != nil {
+			runtime.Events.PublishAgentEvent(ctx, capabilityEvent(req, EventCapabilityFailed, action, map[string]any{"action": action}, err.Error()))
+			actionResults = append(actionResults, ActionResult{Action: action, Error: err.Error()})
 			continue
 		}
 		runtime.Events.PublishAgentEvent(ctx, capabilityEvent(req, EventCapabilityStarted, action, map[string]any{"action": action}, ""))
@@ -116,7 +138,6 @@ func (ActionPlanningStrategy) Run(ctx Context, runtime StrategyRuntime, req Agen
 		actionResults = append(actionResults, ActionResult{Action: action, Result: result})
 	}
 
-	observationBytes, _ := json.MarshalIndent(actionResults, "", "  ")
 	runtime.Events.PublishAgentEvent(ctx, strategyEvent(req, ActionPlanningStrategy{}.Name(), EventFinalAnswerStarted, nil, ""))
 	finalAnswerTrace := runtimecontext.TraceContext{
 		TraceID:       req.TraceID,
@@ -124,13 +145,13 @@ func (ActionPlanningStrategy) Run(ctx Context, runtime StrategyRuntime, req Agen
 		ParentSpanID:  req.TraceContext.SpanID,
 		CorrelationID: req.TraceContext.CorrelationID,
 	}
+	finalMessages, err := assembleContextMessages(ctx, runtime, req, ActionPlanningStrategy{}.Name(), ContextPhaseFinalAnswer, buildFinalAnswerPrompt(req.Agent), actionResults, nil)
+	if err != nil {
+		return AgentRunResult{}, err
+	}
 	finalResponse, err := runtime.Model.Chat(withAgentTraceContext(ctx, finalAnswerTrace), ModelRequest{
-		Model: req.Agent.Model,
-		Messages: []Message{
-			{Role: "system", Content: req.Agent.Prompt + "\n\nUse the observations to answer the user naturally."},
-			{Role: "user", Content: req.UserMessage},
-			{Role: "assistant", Content: "Observations:\n" + string(observationBytes)},
-		},
+		Model:        req.Agent.Model,
+		Messages:     finalMessages,
 		Metadata:     map[string]any{"phase": "final_answer"},
 		TraceID:      req.TraceID,
 		TraceContext: finalAnswerTrace,
@@ -139,8 +160,13 @@ func (ActionPlanningStrategy) Run(ctx Context, runtime StrategyRuntime, req Agen
 		runtime.Events.PublishAgentEvent(ctx, strategyEvent(req, ActionPlanningStrategy{}.Name(), EventFinalAnswerFailed, nil, err.Error()))
 		return AgentRunResult{}, err
 	}
+	output, err := parseAndValidateFinalOutput(req.Agent, finalResponse.Message.Content)
+	if err != nil {
+		runtime.Events.PublishAgentEvent(ctx, strategyEvent(req, ActionPlanningStrategy{}.Name(), EventFinalAnswerFailed, map[string]any{"content": finalResponse.Message.Content}, err.Error()))
+		return AgentRunResult{}, err
+	}
 	runtime.Events.PublishAgentEvent(ctx, strategyEvent(req, ActionPlanningStrategy{}.Name(), EventFinalAnswerCompleted, map[string]any{"content": finalResponse.Message.Content}, ""))
-	return AgentRunResult{Text: finalResponse.Message.Content, Actions: actionResults, Raw: finalResponse.Raw}, nil
+	return AgentRunResult{Text: finalResponse.Message.Content, Output: output, Actions: actionResults, Raw: finalResponse.Raw}, nil
 }
 
 type actionPlan struct {
@@ -149,33 +175,53 @@ type actionPlan struct {
 }
 
 func buildPlanningPrompt(agent AgentSpec, capabilities []CapabilityDescriptor) string {
-	var builder strings.Builder
-	builder.WriteString(agent.Prompt)
-	builder.WriteString("\n\nRuntime Action Planning Contract:\n")
-	builder.WriteString("Plan which capabilities to invoke. Return JSON only, with no markdown.\n")
-	builder.WriteString(`Schema: {"actions":[{"type":"tool|skill|agent|workflow","id":"...","task":"specific task","input":{},"reason":"why this action is needed"}],"final_answer_if_no_action":"optional answer"}`)
-	builder.WriteString("\nConstraints:\n")
-	builder.WriteString("- Select only from the available capabilities below.\n")
-	builder.WriteString("- Keep each action task self-contained.\n")
-	builder.WriteString("- If no capability is needed, return an empty actions array and final_answer_if_no_action.\n")
-	builder.WriteString("\nAvailable capabilities:\n")
-	for _, capability := range capabilities {
-		builder.WriteString(fmt.Sprintf("- type=%s; id=%s; name=%s; description=%s\n", capability.Type, capability.ID, capability.Name, capability.Description))
-	}
-	return builder.String()
+	return coreprompt.BuildPlanningSystemPrompt(coreprompt.PlanningPromptRequest{
+		AgentName:        agent.Name,
+		AgentDescription: agent.Description,
+		Base:             coreprompt.Spec{System: agent.Prompt},
+		Capabilities:     toPromptCapabilities(capabilities),
+		OutputSchema:     agent.OutputSchema,
+	})
+}
+
+func buildFinalAnswerPrompt(agent AgentSpec) string {
+	return coreprompt.BuildFinalAnswerSystemPrompt(coreprompt.Spec{System: agent.Prompt}, agent.OutputSchema)
 }
 
 func parseActionPlan(content string) (actionPlan, error) {
-	content = strings.TrimSpace(content)
-	content = strings.TrimPrefix(content, "```json")
-	content = strings.TrimPrefix(content, "```")
-	content = strings.TrimSuffix(content, "```")
-	content = strings.TrimSpace(content)
-	var plan actionPlan
-	if err := json.Unmarshal([]byte(content), &plan); err != nil {
+	parsed, err := corecapability.ParseActionPlan(content)
+	if err != nil {
 		return actionPlan{}, err
 	}
+	plan := actionPlan{
+		FinalAnswerIfNoAction: parsed.FinalAnswerIfNoAction,
+		Actions:               make([]PlannedAction, 0, len(parsed.Actions)),
+	}
+	for _, action := range parsed.Actions {
+		plan.Actions = append(plan.Actions, PlannedAction{
+			Type:   string(action.Kind),
+			ID:     action.ID,
+			Task:   action.Task,
+			Input:  action.Input,
+			Reason: action.Reason,
+		})
+	}
 	return plan, nil
+}
+
+func toPromptCapabilities(capabilities []CapabilityDescriptor) []coreprompt.CapabilityDescriptor {
+	out := make([]coreprompt.CapabilityDescriptor, 0, len(capabilities))
+	for _, capability := range capabilities {
+		out = append(out, coreprompt.CapabilityDescriptor{
+			ID:           capability.ID,
+			Kind:         capability.Type,
+			Name:         capability.Name,
+			Description:  capability.Description,
+			InputSchema:  capability.InputSchema,
+			OutputSchema: capability.OutputSchema,
+		})
+	}
+	return out
 }
 
 func strategyEvent(req AgentRunRequest, strategy string, eventType AgentEventType, data map[string]any, errText string) AgentEvent {
@@ -185,8 +231,12 @@ func strategyEvent(req AgentRunRequest, strategy string, eventType AgentEventTyp
 }
 
 func capabilityEvent(req AgentRunRequest, eventType AgentEventType, action PlannedAction, data map[string]any, errText string) AgentEvent {
+	return capabilityEventForStrategy(req, ActionPlanningStrategy{}.Name(), eventType, action, data, errText)
+}
+
+func capabilityEventForStrategy(req AgentRunRequest, strategy string, eventType AgentEventType, action PlannedAction, data map[string]any, errText string) AgentEvent {
 	event := newAgentEvent(req, eventType, data, errText)
-	event.Strategy = ActionPlanningStrategy{}.Name()
+	event.Strategy = strategy
 	event.CapabilityID = action.ID
 	event.CapabilityType = action.Type
 	return event

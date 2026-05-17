@@ -19,6 +19,10 @@ func (r *Runtime) Start(ctx context.Context, compiled CompiledWorkflow, input ma
 	return r.engine.Start(ctx, compiled.Spec, input)
 }
 
+func (r *Runtime) StartWithContext(ctx context.Context, compiled CompiledWorkflow, input map[string]any, initialContext *flowengine.DataContext) (flowengine.FlowInstance, error) {
+	return r.engine.StartWithContext(ctx, compiled.Spec, input, initialContext)
+}
+
 func (r *Runtime) Resume(ctx context.Context, compiled CompiledWorkflow, instanceID string, event flowengine.ExternalEvent) (flowengine.FlowInstance, error) {
 	return r.engine.Resume(ctx, compiled.Spec, instanceID, event)
 }
