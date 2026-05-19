@@ -3,7 +3,6 @@ package trace
 import (
 	"context"
 	"fmt"
-	"sort"
 	"sync"
 )
 
@@ -63,12 +62,7 @@ func (s *MemoryStore) ListSpans(_ context.Context, traceID string) ([]Span, erro
 	for _, span := range bySpanID {
 		spans = append(spans, span)
 	}
-	sort.SliceStable(spans, func(i, j int) bool {
-		if spans[i].StartedAt.Equal(spans[j].StartedAt) {
-			return spans[i].SpanID < spans[j].SpanID
-		}
-		return spans[i].StartedAt.Before(spans[j].StartedAt)
-	})
+	sortSpans(spans)
 	return spans, nil
 }
 

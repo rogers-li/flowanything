@@ -1,13 +1,16 @@
 import { useEffect, useMemo, useState } from "react";
 import { assistantTextFromDebugResult, runtimeProgressHeadline, type DebugChatMessage } from "../../components/AgentDebugChat";
-import { defaultTenantId, orchestratorApi, platformApi } from "../../lib/api";
-import { agentDependencies, agents, skills, tools } from "../../lib/mockData";
+import { debugSessionApi, resourceApi, runHistoryApi, runtimeApiV2 } from "../../platform/configApi";
+import type { AgentConfig, RunRecord, SkillConfig, ToolConfig } from "../../platform/configTypes";
+import { useConfigWorkspace } from "../../platform/ConfigWorkspaceProvider";
+import { agentTraceFromTraceResponse } from "../../platform/traceViewModel";
 import type { AgentDebugResponse, AgentDependencies, AgentProfile, AgentTrace, RuntimeEvent, SkillSpec, ToolSpec } from "../../types/platform";
 import { useAutoDismissNotice, type NoticeState } from "../common/useAutoDismissNotice";
-import { agentsClient } from "./api";
-import { agentFromDraft, createAgentDraft, draftFromAgent, emptyAgentDependencies, type AgentDraft } from "./domain";
+import { agentConfigFromDraft, agentProfileFromConfig, dependenciesForAgent, skillSpecFromConfig, toolSpecFromConfig } from "./configModel";
+import { createAgentDraft, draftFromAgent, type AgentDraft } from "./domain";
 
 type Notice = NoticeState;
+
 type AgentDebugSessionRecord = {
   agentId: string;
   agentName: string;
@@ -17,19 +20,15 @@ type AgentDebugSessionRecord = {
   updatedAt: string;
 };
 
-const defaultDebugAgent = agents.find((agent) => agent.id === "agent_weather") ?? agents[0];
-const agentDebugSessionStorageKey = "flow-anything.agent-debug-sessions.v1";
-const maxAgentDebugSessionsPerAgent = 24;
-
 export function useAgents() {
-  const [agentItems, setAgentItems] = useState<AgentProfile[]>(agents);
-  const [skillItems, setSkillItems] = useState<SkillSpec[]>(skills);
-  const [toolItems, setToolItems] = useState<ToolSpec[]>(() => tools.filter((tool) => tool.status === "enabled"));
-  const [selectedAgentId, setSelectedAgentId] = useState(defaultDebugAgent?.id ?? "");
-  const [draft, setDraft] = useState<AgentDraft>(() => (defaultDebugAgent ? draftFromAgent(defaultDebugAgent) : createAgentDraft()));
-  const [dependenciesByAgent, setDependenciesByAgent] = useState<Record<string, AgentDependencies>>(agentDependencies);
+  const workspace = useConfigWorkspace();
+  const [agentItems, setAgentItems] = useState<AgentProfile[]>([]);
+  const [skillItems, setSkillItems] = useState<SkillSpec[]>([]);
+  const [toolItems, setToolItems] = useState<ToolSpec[]>([]);
+  const [selectedAgentId, setSelectedAgentId] = useState("");
+  const [draft, setDraft] = useState<AgentDraft>(() => createAgentDraft());
   const [debugMessage, setDebugMessage] = useState("帮我查一下深圳天气");
-  const [debugSessionId, setDebugSessionId] = useState(() => createClientID("debug_session"));
+  const [debugSessionId, setDebugSessionId] = useState("");
   const [debugResult, setDebugResult] = useState<AgentDebugResponse | null>(null);
   const [debugTrace, setDebugTrace] = useState<AgentTrace | null>(null);
   const [debugChatMessages, setDebugChatMessages] = useState<DebugChatMessage[]>([]);
@@ -41,92 +40,127 @@ export function useAgents() {
     () => agentItems.find((agent) => agent.id === selectedAgentId),
     [agentItems, selectedAgentId]
   );
-  const selectedDependencies = selectedAgent
-    ? dependenciesByAgent[selectedAgent.id] ?? emptyAgentDependencies(selectedAgent.id)
-    : emptyAgentDependencies("");
+
+  const selectedDependencies = useMemo(
+    () => dependenciesForAgent(selectedAgent, skillItems, toolItems),
+    [selectedAgent, skillItems, toolItems]
+  );
+
+  const dependenciesByAgent = useMemo<Record<string, AgentDependencies>>(
+    () => Object.fromEntries(agentItems.map((agent) => [agent.id, dependenciesForAgent(agent, skillItems, toolItems)])),
+    [agentItems, skillItems, toolItems]
+  );
 
   useEffect(() => {
     void refresh();
-  }, []);
+  }, [workspace.activeBundleId]);
 
   useEffect(() => {
     if (!selectedAgent) {
-      setDraft(createAgentDraft());
+      if (!selectedAgentId) setDraft(createAgentDraft());
       setDebugSessions([]);
       return;
     }
-    // Keep the editor draft aligned when the backend replaces the initial mock agent with the same id.
     setDraft(draftFromAgent(selectedAgent));
     resetDebugSession();
-    setDebugSessions(readAgentDebugSessions(selectedAgent.id));
-    void loadDependencies(selectedAgent.id);
-  }, [selectedAgent]);
-
-  useEffect(() => {
-    if (!selectedAgent) return;
-    persistAgentDebugSession(selectedAgent, debugSessionId, debugChatMessages);
-    setDebugSessions(readAgentDebugSessions(selectedAgent.id));
-  }, [debugChatMessages, debugSessionId, selectedAgent?.id, selectedAgent?.name]);
+    void loadDebugHistory(selectedAgent.id);
+  }, [selectedAgent?.id]);
 
   async function refresh() {
+    if (!workspace.activeBundleId) {
+      setAgentItems([]);
+      setSkillItems([]);
+      setToolItems([]);
+      setSelectedAgentId("");
+      return;
+    }
     try {
-      const [remoteAgents, remoteSkills, remoteTools] = await Promise.all([
-        agentsClient.listAgents(),
-        platformApi.listSkills().then((response) => response.items),
-        platformApi.listTools({ status: "enabled" }).then((response) => response.items)
+      const [agents, skills, tools] = await Promise.all([
+        resourceApi.listResourcesByKind<AgentConfig>(workspace.activeBundleId, "agent"),
+        resourceApi.listResourcesByKind<SkillConfig>(workspace.activeBundleId, "skill"),
+        resourceApi.listResourcesByKind<ToolConfig>(workspace.activeBundleId, "tool")
       ]);
-      if (remoteAgents.length > 0) {
-        setAgentItems(remoteAgents);
-        setSelectedAgentId((current) => (remoteAgents.some((agent) => agent.id === current) ? current : remoteAgents[0].id));
+      const nextAgents = agents.items.map((item) => agentProfileFromConfig(item.resource));
+      const nextSkills = skills.items.map((item) => skillSpecFromConfig(item.resource));
+      const nextTools = tools.items.map((item) => toolSpecFromConfig(item.resource));
+      setAgentItems(nextAgents);
+      setSkillItems(nextSkills);
+      setToolItems(nextTools);
+      setSelectedAgentId((current) => (nextAgents.some((agent) => agent.id === current) ? current : nextAgents[0]?.id ?? ""));
+      if (nextAgents.length === 0) {
+        setDraft(createAgentDraft());
       }
-      if (remoteSkills.length > 0) {
-        setSkillItems(remoteSkills);
-      }
-      setToolItems(remoteTools);
-    } catch {
-      setToolItems((current) => current.filter((tool) => tool.status === "enabled"));
-      setNotice({ ok: false, message: "Using local agent mock data because backend APIs are unavailable." });
+    } catch (error) {
+      setNotice({ ok: false, message: error instanceof Error ? error.message : "Failed to load Agents from active Bundle." });
     }
   }
 
-  async function loadDependencies(agentId: string) {
+  async function loadDebugHistory(agentId: string) {
     try {
-      const dependencies = await agentsClient.getDependencies(agentId);
-      setDependenciesByAgent((current) => ({ ...current, [agentId]: dependencies }));
+      const response = await runHistoryApi.list();
+      setDebugSessions(
+        response.items
+          .filter((record) => record.type === "agent" && record.agent_request?.agent_id === agentId)
+          .map(debugSessionRecordFromRun)
+      );
     } catch {
-      setDependenciesByAgent((current) => ({
-        ...current,
-        [agentId]: current[agentId] ?? emptyAgentDependencies(agentId)
-      }));
+      setDebugSessions([]);
     }
   }
 
   async function saveDraft() {
+    if (!workspace.activeBundleId) {
+      setNotice({ ok: false, message: "Create or select a draft Bundle before saving Agents." });
+      return;
+    }
     try {
-      const agent = agentFromDraft(draft, defaultTenantId);
-      const saved = await agentsClient.saveAgent(agent);
-      upsertAgent(saved);
-      setSelectedAgentId(saved.id);
-      setDraft(draftFromAgent(saved));
-      setNotice({ ok: true, message: "Agent saved." });
+      const config = agentConfigFromDraft(draft);
+      const response = await resourceApi.upsertResource(workspace.activeBundleId, "agent", config);
+      const saved = response.bundle.resources?.agents?.find((agent) => agent.id === config.id) ?? config;
+      const viewModel = agentProfileFromConfig(saved);
+      upsertAgent(viewModel);
+      setSelectedAgentId(viewModel.id);
+      setDraft(draftFromAgent(viewModel));
+      await workspace.refresh();
+      setNotice({ ok: true, message: "Agent saved to draft Bundle." });
     } catch (error) {
-      setNotice({ ok: false, message: error instanceof Error ? error.message : "Failed to save agent." });
+      setNotice({ ok: false, message: error instanceof Error ? error.message : "Failed to save Agent." });
     }
   }
 
   async function enableSelected() {
     if (!selectedAgent) return;
-    await changeStatus(selectedAgent.id, "enabled");
+    await changeDisabled(selectedAgent.id, false);
   }
 
   async function disableSelected() {
     if (!selectedAgent) return;
-    await changeStatus(selectedAgent.id, "disabled");
+    await changeDisabled(selectedAgent.id, true);
+  }
+
+  async function changeDisabled(agentId: string, disabled: boolean) {
+    if (!workspace.activeBundleId) return;
+    try {
+      const resource = await resourceApi.getResource<AgentConfig>(workspace.activeBundleId, "agent", agentId);
+      const next = { ...resource.resource, disabled };
+      await resourceApi.upsertResource(workspace.activeBundleId, "agent", next);
+      const saved = agentProfileFromConfig(next);
+      upsertAgent(saved);
+      setDraft(draftFromAgent(saved));
+      await workspace.refresh();
+      setNotice({ ok: true, message: `Agent ${disabled ? "disabled" : "enabled"}.` });
+    } catch (error) {
+      setNotice({ ok: false, message: error instanceof Error ? error.message : "Failed to update Agent status." });
+    }
   }
 
   async function runDebug() {
-    if (!selectedAgent) return;
-    if (isDebugRunning) return;
+    if (!selectedAgent || isDebugRunning) return;
+    if (!workspace.activeBundleId) {
+      setNotice({ ok: false, message: "Select a draft Bundle before debugging Agents." });
+      return;
+    }
+
     const submittedMessage = debugMessage;
     const userText = submittedMessage.trim() || "(empty message)";
     const traceId = createClientID("trace");
@@ -141,108 +175,137 @@ export function useAgents() {
       role: "assistant",
       text: "正在分析请求...",
       traceId,
-      liveEvents: [],
       pending: true
     };
+
     setDebugMessage("");
     setDebugChatMessages((current) => [...current, userMessage, liveMessage]);
     setIsDebugRunning(true);
-    const stopLiveEvents = orchestratorApi.subscribeLiveEvents(traceId, (event) => {
-      if (event.type === "connected") return;
-      setDebugChatMessages((current) =>
-        current.map((message) => {
-          if (message.id !== liveMessageId) return message;
-          const liveEvents = [...(message.liveEvents ?? []), event];
-          return {
-            ...message,
-            text: liveDebugText(liveEvents),
-            liveEvents
-          };
-        })
-      );
-    });
+    const stopTracePolling = startDebugTracePolling(traceId, liveMessageId);
+
     try {
-      const result = await agentsClient.debugAgent({
-        tenantId: defaultTenantId,
-        traceId,
-        userId: "debug_user",
-        sessionId: debugSessionId,
-        agentId: selectedAgent.id,
-        type: "user_message_committed",
-        channel: "text",
-        payload: {
-          text: userText
-        },
-        occurredAt: new Date().toISOString()
+      const sessionId = await ensureDebugSession(selectedAgent.id);
+      const result = await debugSessionApi.runAgent(sessionId, {
+        agent_id: selectedAgent.id,
+        user_message: userText,
+        conversation: conversationFromMessages(debugChatMessages),
+        trace_context: {
+          trace_id: traceId
+        }
       });
-      setDebugResult(result);
+      const response = agentDebugResponseFromRun(result.result.text, traceId);
+      setDebugResult(response);
+
       let trace: AgentTrace | null = null;
       try {
-        trace = await agentsClient.getTrace(result.traceId);
+        trace = agentTraceFromTraceResponse(await runtimeApiV2.getTrace(traceId));
         setDebugTrace(trace);
       } catch {
         setDebugTrace(null);
       }
-      const assistantReply = assistantTextFromDebugResult(result);
-      setDebugChatMessages((current) =>
-        [
-          ...current.map((message) =>
-            message.id === liveMessageId
-              ? {
-                  ...message,
-                  text: processMessageText(message.liveEvents),
-                  traceId: result.traceId,
-                  trace,
-                  pending: false
-                }
-              : message
-          ),
-          {
-            id: createClientID("chat_agent"),
-            role: "assistant" as const,
-            text: assistantReply,
-            traceId: result.traceId,
-            trace,
-            pending: false
-          }
-        ]
-      );
-      setNotice({ ok: true, message: "Agent debug event completed." });
-    } catch (error) {
-      setDebugResult(null);
-      setDebugTrace(null);
+
+      const assistantReply = assistantTextFromDebugResult(response);
       setDebugChatMessages((current) =>
         current.map((message) =>
           message.id === liveMessageId
             ? {
                 ...message,
-                text: error instanceof Error ? error.message : "Failed to run agent debug event.",
+                text: assistantReply,
+                traceId,
+                trace,
+                liveEvents: trace ? runtimeEventsFromTrace(trace) : message.liveEvents,
                 pending: false
               }
             : message
         )
       );
-      setNotice({ ok: false, message: error instanceof Error ? error.message : "Failed to run agent debug event." });
+      await loadDebugHistory(selectedAgent.id);
+      setNotice({ ok: true, message: "Agent debug completed." });
+    } catch (error) {
+      setDebugResult(null);
+      let trace: AgentTrace | null = null;
+      try {
+        trace = agentTraceFromTraceResponse(await runtimeApiV2.getTrace(traceId));
+        setDebugTrace(trace);
+      } catch {
+        setDebugTrace(null);
+      }
+      setDebugChatMessages((current) =>
+        current.map((message) =>
+          message.id === liveMessageId
+            ? {
+                ...message,
+                text: error instanceof Error ? error.message : "Failed to run Agent debug.",
+                trace,
+                liveEvents: trace ? runtimeEventsFromTrace(trace) : message.liveEvents,
+                pending: false
+              }
+            : message
+        )
+      );
+      setNotice({ ok: false, message: error instanceof Error ? error.message : "Failed to run Agent debug." });
     } finally {
-      stopLiveEvents();
+      stopTracePolling();
       setIsDebugRunning(false);
     }
   }
 
-  async function changeStatus(agentId: string, status: AgentProfile["status"]) {
-    try {
-      const saved = status === "enabled" ? await agentsClient.enableAgent(agentId) : await agentsClient.disableAgent(agentId);
-      upsertAgent(saved);
-      setDraft(draftFromAgent(saved));
-      setNotice({ ok: true, message: `Agent ${status}.` });
-    } catch (error) {
-      setNotice({ ok: false, message: error instanceof Error ? error.message : `Failed to mark agent ${status}.` });
-    }
+  function startDebugTracePolling(traceId: string, liveMessageId: string): () => void {
+    let stopped = false;
+    let timer: number | undefined;
+
+    const poll = async () => {
+      if (stopped) return;
+      try {
+        const trace = agentTraceFromTraceResponse(await runtimeApiV2.getTrace(traceId));
+        const liveEvents = runtimeEventsFromTrace(trace);
+        setDebugTrace(trace);
+        setDebugChatMessages((current) =>
+          current.map((message) =>
+            message.id === liveMessageId && message.pending
+              ? {
+                  ...message,
+                  text: runtimeProgressHeadline(liveEvents),
+                  trace,
+                  liveEvents
+                }
+              : message
+          )
+        );
+      } catch {
+        // The trace is created asynchronously after the runtime receives the request.
+      }
+      if (!stopped) {
+        timer = window.setTimeout(poll, 900);
+      }
+    };
+
+    timer = window.setTimeout(poll, 400);
+    return () => {
+      stopped = true;
+      if (timer !== undefined) {
+        window.clearTimeout(timer);
+      }
+    };
+  }
+
+  async function ensureDebugSession(agentId: string): Promise<string> {
+    if (debugSessionId) return debugSessionId;
+    const response = await debugSessionApi.createSession({
+      bundle_id: workspace.activeBundleId,
+      entrypoint: {
+        kind: "agent",
+        id: agentId
+      }
+    });
+    setDebugSessionId(response.session.id);
+    return response.session.id;
   }
 
   function startNewAgent() {
     setSelectedAgentId("");
     setDraft(createAgentDraft());
+    resetDebugSession();
   }
 
   function selectAgent(agentId: string) {
@@ -250,7 +313,7 @@ export function useAgents() {
   }
 
   function resetDebugSession() {
-    setDebugSessionId(createClientID("debug_session"));
+    setDebugSessionId("");
     setDebugResult(null);
     setDebugTrace(null);
     setDebugChatMessages([]);
@@ -260,7 +323,7 @@ export function useAgents() {
     setDebugSessionId(session.sessionId);
     setDebugResult(null);
     setDebugTrace(null);
-    setDebugChatMessages(messagesForHistory(session.messages));
+    setDebugChatMessages(session.messages);
   }
 
   function upsertAgent(agent: AgentProfile) {
@@ -284,7 +347,7 @@ export function useAgents() {
     setDraft,
     debugMessage,
     setDebugMessage,
-    debugSessionId,
+    debugSessionId: debugSessionId || "new_preview_session",
     debugResult,
     debugTrace,
     debugChatMessages,
@@ -309,128 +372,82 @@ function createClientID(prefix: string): string {
   return `${prefix}_${Date.now()}`;
 }
 
-function liveDebugText(events: RuntimeEvent[]): string {
-  return runtimeProgressHeadline(events);
+function agentDebugResponseFromRun(text: string, traceId: string): AgentDebugResponse {
+  return {
+    eventId: createClientID("evt"),
+    traceId,
+    actions: [
+      {
+        type: "speak",
+        text
+      },
+      {
+        type: "end_turn"
+      }
+    ]
+  };
 }
 
-function processMessageText(events?: RuntimeEvent[]): string {
-  if (!events || events.length === 0) return "处理过程";
-  if (events.some((event) => event.type === "run_failed")) return "处理过程：执行失败。";
-  if (events.some((event) => event.type === "run_completed")) return "处理过程：执行完成。";
-  return "处理过程";
+function conversationFromMessages(messages: DebugChatMessage[]): Array<{ role: string; content: string }> {
+  return messages
+    .filter((message) => !message.pending && message.text.trim())
+    .map((message) => ({
+      role: message.role === "user" ? "user" : "assistant",
+      content: message.text
+    }));
 }
 
-function isAgentDebugSessionRecord(value: unknown): value is AgentDebugSessionRecord {
-  if (!value || typeof value !== "object") return false;
-  const record = value as Partial<AgentDebugSessionRecord>;
-  return (
-    typeof record.agentId === "string" &&
-    typeof record.agentName === "string" &&
-    typeof record.createdAt === "string" &&
-    Array.isArray(record.messages) &&
-    typeof record.sessionId === "string" &&
-    typeof record.updatedAt === "string"
-  );
-}
-
-function readAllAgentDebugSessions(): AgentDebugSessionRecord[] {
-  if (typeof window === "undefined") return [];
-  try {
-    const raw = window.localStorage.getItem(agentDebugSessionStorageKey);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw) as unknown;
-    return Array.isArray(parsed)
-      ? parsed.filter(isAgentDebugSessionRecord).map((session) => ({ ...session, messages: messagesForHistory(session.messages) }))
-      : [];
-  } catch {
-    return [];
-  }
-}
-
-function readAgentDebugSessions(agentId: string): AgentDebugSessionRecord[] {
-  return readAllAgentDebugSessions()
-    .filter((session) => session.agentId === agentId)
-    .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
-}
-
-function messagesForHistory(messages: DebugChatMessage[]): DebugChatMessage[] {
-  const normalized = messages.map((message) => ({
-    id: message.id,
-    role: message.role,
-    text: message.text,
-    traceId: message.traceId,
-    liveEvents: message.liveEvents,
-    // Restored history is no longer streaming, so show the full progress list.
-    pending: false
+function runtimeEventsFromTrace(trace: AgentTrace): RuntimeEvent[] {
+  return trace.steps.map((step) => ({
+    id: step.id,
+    type: "trace_step_added",
+    tenantId: trace.tenantId,
+    traceId: trace.traceId,
+    sessionId: trace.sessionId,
+    stepId: step.id,
+    stepType: step.type,
+    name: step.name,
+    status: step.status,
+    payload: {
+      step
+    },
+    createdAt: step.startedAt
   }));
-  const withRecoveredReplies: DebugChatMessage[] = [];
-  for (const message of normalized) {
-    withRecoveredReplies.push(message);
-    const recoveredReply = finalAssistantTextFromEvents(message.liveEvents);
-    if (!message.traceId || !recoveredReply) continue;
-    const alreadyExists = normalized.some(
-      (candidate) =>
-        candidate.role === "assistant" &&
-        candidate.traceId === message.traceId &&
-        candidate.text.trim() === recoveredReply
-    );
-    if (alreadyExists) continue;
-    withRecoveredReplies.push({
-      id: `${message.id}_recovered_reply`,
+}
+
+function debugSessionRecordFromRun(record: RunRecord): AgentDebugSessionRecord {
+  const userText = record.agent_request?.user_message ?? "";
+  const assistantText = resultText(record.result) || record.error || "";
+  const messages: DebugChatMessage[] = [
+    {
+      id: `${record.id}_user`,
+      role: "user",
+      text: userText
+    }
+  ];
+  if (assistantText) {
+    messages.push({
+      id: `${record.id}_assistant`,
       role: "assistant",
-      text: recoveredReply,
-      traceId: message.traceId,
+      text: assistantText,
+      traceId: record.trace_id,
       pending: false
     });
   }
-  return withRecoveredReplies;
-}
-
-function persistAgentDebugSession(agent: AgentProfile, sessionId: string, messages: DebugChatMessage[]) {
-  if (typeof window === "undefined" || messages.length === 0) return;
-
-  const now = new Date().toISOString();
-  const allSessions = readAllAgentDebugSessions();
-  const existing = allSessions.find((session) => session.agentId === agent.id && session.sessionId === sessionId);
-  const nextRecord: AgentDebugSessionRecord = {
-    agentId: agent.id,
-    agentName: agent.name,
-    createdAt: existing?.createdAt ?? now,
-    messages: messagesForHistory(messages),
-    sessionId,
-    updatedAt: now
+  return {
+    agentId: record.agent_request?.agent_id ?? record.entrypoint?.id ?? "",
+    agentName: record.entrypoint?.id ?? "Agent",
+    createdAt: record.started_at ?? "",
+    messages,
+    sessionId: record.session_id ?? "",
+    updatedAt: record.finished_at ?? record.started_at ?? ""
   };
-  const merged = [
-    nextRecord,
-    ...allSessions.filter((session) => !(session.agentId === agent.id && session.sessionId === sessionId))
-  ].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
-  const keptCurrentAgentSessionIds = new Set(
-    merged
-      .filter((session) => session.agentId === agent.id)
-      .slice(0, maxAgentDebugSessionsPerAgent)
-      .map((session) => session.sessionId)
-  );
-
-  try {
-    window.localStorage.setItem(
-      agentDebugSessionStorageKey,
-      JSON.stringify(merged.filter((session) => session.agentId !== agent.id || keptCurrentAgentSessionIds.has(session.sessionId)))
-    );
-  } catch {
-    // Debug history is local convenience data. Agent execution should not depend on browser storage.
-  }
 }
 
-function finalAssistantTextFromEvents(events?: RuntimeEvent[]): string {
-  if (!events?.some((event) => event.type === "run_completed")) return "";
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const event = events[index];
-    if (event.type !== "assistant_message_completed") continue;
-    return stringFromUnknown(event.payload?.text);
-  }
+function resultText(result: unknown): string {
+  if (!result || typeof result !== "object") return "";
+  const value = result as { text?: unknown; result?: { text?: unknown } };
+  if (typeof value.text === "string") return value.text;
+  if (typeof value.result?.text === "string") return value.result.text;
   return "";
-}
-
-function stringFromUnknown(value: unknown): string {
-  return typeof value === "string" ? value.trim() : "";
 }

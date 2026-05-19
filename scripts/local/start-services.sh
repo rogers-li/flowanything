@@ -3,27 +3,22 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ENV_FILE="${FLOW_ANYTHING_ENV_FILE:-$ROOT_DIR/configs/local/services.env}"
+LOCAL_ENV_FILE="${FLOW_ANYTHING_LOCAL_ENV_FILE:-$ROOT_DIR/configs/local/services.local.env}"
 RUNTIME_DIR="${FLOW_ANYTHING_RUNTIME_DIR:-$ROOT_DIR/.runtime/local}"
 LOG_DIR="${FLOW_ANYTHING_LOG_DIR:-$ROOT_DIR/log/local}"
 BIN_DIR="${FLOW_ANYTHING_BIN_DIR:-$RUNTIME_DIR/bin}"
 PID_FILE="$RUNTIME_DIR/services.pid"
 GOCACHE="${GOCACHE:-/tmp/flow-anything-gocache}"
-AUTO_SEED="${FLOW_ANYTHING_AUTO_SEED:-true}"
-
-SERVICES=(
-  "platform-api:platform-api"
-  "connector-service:connector-service"
-  "knowledge-service:knowledge-service"
-  "agent-runtime:agent-runtime"
-  "model-gateway:model-gateway"
-  "ai-orchestrator:ai-orchestrator"
-  "agent-flow-runtime:agent-flow-runtime"
-  "mock-business-api:mock-business-api"
-)
+SERVICES=()
 
 load_env_file() {
-  if [[ ! -f "$ENV_FILE" ]]; then
-    echo "env file not found: $ENV_FILE"
+  local file_path="$1"
+  local required="${2:-false}"
+
+  if [[ ! -f "$file_path" ]]; then
+    if [[ "$required" == "true" ]]; then
+      echo "env file not found: $file_path"
+    fi
     return
   fi
 
@@ -36,7 +31,14 @@ load_env_file() {
     # Use export "KEY=VALUE" instead of source so values can safely contain
     # spaces, Chinese text, and punctuation without shell escaping.
     export "$line"
-  done < "$ENV_FILE"
+  done < "$file_path"
+}
+
+configure_services() {
+  SERVICES=("ai-platform-runtime:ai-platform-runtime")
+  if [[ "${FLOW_ANYTHING_START_MOCK_BUSINESS_API:-false}" == "true" ]]; then
+    SERVICES+=("mock-business-api:mock-business-api")
+  fi
 }
 
 existing_pid_for() {
@@ -101,46 +103,37 @@ start_service() {
   fi
 }
 
-wait_for_platform_api() {
-  local platform_url="${PLATFORM_API_URL:-http://localhost:8080}"
+wait_for_ai_platform_runtime() {
+  local runtime_url="${FLOW_ANYTHING_RUNTIME_URL:-http://localhost:8081}"
   local attempts=30
 
   for _ in $(seq 1 "$attempts"); do
-    if curl -fsS "$platform_url/v1/agents?tenant_id=tenant_1" >/dev/null 2>&1; then
+    if curl -fsS "$runtime_url/healthz" >/dev/null 2>&1; then
       return 0
     fi
     sleep 0.5
   done
 
-  echo "platform-api is not ready at $platform_url"
+  echo "ai-platform-runtime is not ready at $runtime_url"
   return 1
-}
-
-seed_local_flows() {
-  if [[ "$AUTO_SEED" != "true" ]]; then
-    return
-  fi
-
-  echo
-  echo "seed local weather flow"
-  wait_for_platform_api
-  bash "$ROOT_DIR/scripts/local/seed-weather-flow.sh"
 }
 
 main() {
   mkdir -p "$RUNTIME_DIR" "$LOG_DIR" "$BIN_DIR"
   touch "$PID_FILE"
-  load_env_file
+  load_env_file "$ENV_FILE" true
+  load_env_file "$LOCAL_ENV_FILE" false
+  configure_services
 
   for item in "${SERVICES[@]}"; do
     IFS=: read -r service_name command_dir <<< "$item"
     start_service "$service_name" "$command_dir"
   done
 
-  seed_local_flows
+  wait_for_ai_platform_runtime
 
   echo
-  echo "services started. pid file: $PID_FILE"
+  echo "new runtime services started. pid file: $PID_FILE"
   echo "logs:"
   for item in "${SERVICES[@]}"; do
     IFS=: read -r service_name _ <<< "$item"

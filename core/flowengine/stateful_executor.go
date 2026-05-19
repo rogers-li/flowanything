@@ -235,8 +235,8 @@ func (e *StatefulExecutor) executeReadyToken(ctx context.Context, spec FlowSpec,
 	state.Input = input
 	state.StartedAt = time.Now()
 	instance.NodeStates[node.ID] = state
-	e.emit(ctx, instance.InstanceID, spec.ID, FlowEvent{Type: EventNodeScheduled, NodeID: node.ID, NodeType: node.Type})
-	e.emit(ctx, instance.InstanceID, spec.ID, FlowEvent{Type: EventNodeStarted, NodeID: node.ID, NodeType: node.Type, Input: input})
+	e.emit(ctx, instance.InstanceID, spec.ID, FlowEvent{Type: EventNodeScheduled, NodeID: node.ID, NodeType: node.Type, Data: nodeEventData(node)})
+	e.emit(ctx, instance.InstanceID, spec.ID, FlowEvent{Type: EventNodeStarted, NodeID: node.ID, NodeType: node.Type, Input: input, Data: nodeEventData(node)})
 
 	if node.Type == NodeTypeWait {
 		return e.blockOnWaitNode(ctx, spec, instance, tokenIndex, node, input)
@@ -303,7 +303,7 @@ func (e *StatefulExecutor) blockOnWaitNode(ctx context.Context, spec FlowSpec, i
 		NodeID:   node.ID,
 		NodeType: node.Type,
 		Input:    input,
-		Data:     map[string]any{"waiting_for": condition},
+		Data:     mergeNodeEventData(node, map[string]any{"waiting_for": condition}),
 	})
 	return nil
 }
@@ -344,7 +344,7 @@ func (e *StatefulExecutor) executeJoinNode(ctx context.Context, spec FlowSpec, i
 			NodeID:   node.ID,
 			NodeType: node.Type,
 			Input:    input,
-			Data:     map[string]any{"arrived": cloneBoolMap(state.ArrivedNodes), "expected": state.ExpectedNodes},
+			Data:     mergeNodeEventData(node, map[string]any{"arrived": cloneBoolMap(state.ArrivedNodes), "expected": state.ExpectedNodes}),
 		})
 		return nil
 	}
@@ -359,7 +359,7 @@ func (e *StatefulExecutor) executeJoinNode(ctx context.Context, spec FlowSpec, i
 	nodeState.Output = output
 	nodeState.FinishedAt = time.Now()
 	instance.NodeStates[node.ID] = nodeState
-	e.emit(ctx, instance.InstanceID, spec.ID, FlowEvent{Type: EventNodeCompleted, NodeID: node.ID, NodeType: node.Type, Input: input, Output: output})
+	e.emit(ctx, instance.InstanceID, spec.ID, FlowEvent{Type: EventNodeCompleted, NodeID: node.ID, NodeType: node.Type, Input: input, Output: output, Data: nodeEventData(node)})
 	e.appendNextTokens(ctx, spec, instance, node.ID, outgoingEdges(spec.Edges)[node.ID])
 	return nil
 }
@@ -375,7 +375,7 @@ func (e *StatefulExecutor) completeNode(ctx context.Context, spec FlowSpec, inst
 	state.Output = output
 	state.FinishedAt = time.Now()
 	instance.NodeStates[node.ID] = state
-	e.emit(ctx, instance.InstanceID, spec.ID, FlowEvent{Type: EventNodeCompleted, NodeID: node.ID, NodeType: node.Type, Input: input, Output: output})
+	e.emit(ctx, instance.InstanceID, spec.ID, FlowEvent{Type: EventNodeCompleted, NodeID: node.ID, NodeType: node.Type, Input: input, Output: output, Data: nodeEventData(node)})
 	e.appendNextTokens(ctx, spec, instance, node.ID, nextIDs)
 }
 
@@ -391,7 +391,7 @@ func (e *StatefulExecutor) failNode(ctx context.Context, spec FlowSpec, instance
 	state.Error = err.Error()
 	state.FinishedAt = time.Now()
 	instance.NodeStates[node.ID] = state
-	e.emit(ctx, instance.InstanceID, spec.ID, FlowEvent{Type: EventNodeFailed, NodeID: node.ID, NodeType: node.Type, Input: input, Output: output, Error: err.Error()})
+	e.emit(ctx, instance.InstanceID, spec.ID, FlowEvent{Type: EventNodeFailed, NodeID: node.ID, NodeType: node.Type, Input: input, Output: output, Error: err.Error(), Data: nodeEventData(node)})
 	return err
 }
 
@@ -413,6 +413,22 @@ func (e *StatefulExecutor) newToken(nodeID, sourceNodeID string, now time.Time) 
 		CreatedAt:    now,
 		UpdatedAt:    now,
 	}
+}
+
+func nodeEventData(node NodeSpec) map[string]any {
+	data := map[string]any{}
+	if node.Name != "" {
+		data["node_name"] = node.Name
+	}
+	return data
+}
+
+func mergeNodeEventData(node NodeSpec, extra map[string]any) map[string]any {
+	data := nodeEventData(node)
+	for key, value := range extra {
+		data[key] = value
+	}
+	return data
 }
 
 func (e *StatefulExecutor) finalizeBlockedInstance(ctx context.Context, spec FlowSpec, instance FlowInstance) FlowInstance {

@@ -45,7 +45,7 @@ func (e ToolNodeExecutor) Execute(ctx context.Context, req flowengine.NodeReques
 		ToolID:       config.ToolID,
 		Input:        req.Input,
 		Metadata:     config.Metadata,
-		TraceContext: traceContextFrom(ctx),
+		TraceContext: childTraceContextFrom(ctx),
 	})
 	if err != nil {
 		return flowengine.NodeResult{}, err

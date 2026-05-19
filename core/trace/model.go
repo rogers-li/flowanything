@@ -16,6 +16,7 @@ const (
 	SpanKindAgent     SpanKind = "AGENT"
 	SpanKindPlanning  SpanKind = "PLANNING"
 	SpanKindLLM       SpanKind = "LLM"
+	SpanKindSkill     SpanKind = "SKILL"
 	SpanKindTool      SpanKind = "TOOL"
 	SpanKindConnector SpanKind = "CONNECTOR"
 	SpanKindWorkflow  SpanKind = "WORKFLOW"

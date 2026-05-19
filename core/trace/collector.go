@@ -3,6 +3,7 @@ package trace
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	agentcore "flow-anything/core/agentcore"
@@ -82,7 +83,7 @@ func (c *Collector) OnFlowEvent(ctx context.Context, event flowengine.FlowEvent)
 		spanID := firstNonEmpty(event.TraceContext.SpanID, nodeSpanID(event.RunID, event.NodeID))
 		c.upsert(ctx, Span{
 			TraceID: traceID, SpanID: spanID, ParentSpanID: firstNonEmpty(event.TraceContext.ParentSpanID, runtimecontext.FlowSpanID(event.RunID)),
-			Name: "Node " + event.NodeID, Kind: SpanKindNode, Status: SpanStatusRunning,
+			Name: nodeSpanName(event), Kind: SpanKindNode, Status: SpanStatusRunning,
 			StartedAt: timestamp, Input: c.redact(event.Input),
 			Attributes: mergeMap(map[string]any{"node_id": event.NodeID, "node_type": event.NodeType}, c.redact(event.Data)),
 		})
@@ -99,6 +100,16 @@ func (c *Collector) OnFlowEvent(ctx context.Context, event flowengine.FlowEvent)
 		}
 		c.upsert(ctx, Span{TraceID: traceID, SpanID: parent, Events: []SpanEvent{spanEvent(string(event.Type), map[string]any{"node_id": event.NodeID, "source_node_id": event.SourceNodeID, "target_node_id": event.TargetNodeID}, timestamp)}})
 	}
+}
+
+func nodeSpanName(event flowengine.FlowEvent) string {
+	if name, ok := event.Data["node_name"].(string); ok && name != "" {
+		return name
+	}
+	if event.NodeID != "" {
+		return "Node " + event.NodeID
+	}
+	return "Node"
 }
 
 func (c *Collector) OnAgentEvent(ctx agentcore.Context, event agentcore.AgentEvent) {
@@ -127,7 +138,13 @@ func (c *Collector) OnAgentEvent(ctx agentcore.Context, event agentcore.AgentEve
 		base.FinishedAt = timestamp
 		base.Error = event.Error
 	case agentcore.EventPlanningStarted, agentcore.EventPlanningCompleted, agentcore.EventPlanningFailed:
-		c.handleChildAgentSpan(ctxFor(ctx), traceID, firstNonEmpty(event.TraceContext.SpanID, planningSpanID(traceID, event.AgentID)), firstNonEmpty(event.TraceContext.ParentSpanID, runtimecontext.AgentSpanID(traceID, event.AgentID)), SpanKindPlanning, "Planning", event.Type, event.Data, event.Error, timestamp)
+		name := "Planning"
+		if event.Strategy == "react" {
+			name = "ReAct plan / observe"
+		} else if event.Strategy == "rewoo" {
+			name = "ReWOO plan"
+		}
+		c.handleChildAgentSpan(ctxFor(ctx), traceID, firstNonEmpty(event.TraceContext.SpanID, planningSpanID(traceID, event.AgentID)), firstNonEmpty(event.TraceContext.ParentSpanID, runtimecontext.AgentSpanID(traceID, event.AgentID)), SpanKindPlanning, name, event.Type, event.Data, event.Error, timestamp)
 		return
 	case agentcore.EventModelStarted, agentcore.EventModelCompleted, agentcore.EventModelFailed:
 		phase := fmt.Sprint(event.Data["phase"])
@@ -137,7 +154,8 @@ func (c *Collector) OnAgentEvent(ctx agentcore.Context, event agentcore.AgentEve
 		c.handleChildAgentSpan(ctxFor(ctx), traceID, firstNonEmpty(event.TraceContext.SpanID, modelSpanID(traceID, event.AgentID, phase)), firstNonEmpty(event.TraceContext.ParentSpanID, runtimecontext.AgentSpanID(traceID, event.AgentID)), SpanKindLLM, "Model "+phase, event.Type, event.Data, event.Error, timestamp)
 		return
 	case agentcore.EventCapabilityStarted, agentcore.EventCapabilityCompleted, agentcore.EventCapabilityFailed:
-		c.handleChildAgentSpan(ctxFor(ctx), traceID, firstNonEmpty(event.TraceContext.SpanID, capabilitySpanID(traceID, event.AgentID, event.CapabilityType, event.CapabilityID)), firstNonEmpty(event.TraceContext.ParentSpanID, runtimecontext.AgentSpanID(traceID, event.AgentID)), SpanKindTool, "Capability "+event.CapabilityID, event.Type, event.Data, event.Error, timestamp)
+		kind := spanKindForCapability(event.CapabilityType)
+		c.handleChildAgentSpan(ctxFor(ctx), traceID, firstNonEmpty(event.TraceContext.SpanID, capabilitySpanID(traceID, event.AgentID, event.CapabilityType, event.CapabilityID)), firstNonEmpty(event.TraceContext.ParentSpanID, runtimecontext.AgentSpanID(traceID, event.AgentID)), kind, capabilitySpanName(kind, event.CapabilityID), event.Type, event.Data, event.Error, timestamp)
 		return
 	case agentcore.EventFinalAnswerStarted, agentcore.EventFinalAnswerCompleted, agentcore.EventFinalAnswerFailed:
 		c.handleChildAgentSpan(ctxFor(ctx), traceID, firstNonEmpty(event.TraceContext.SpanID, finalAnswerSpanID(traceID, event.AgentID)), firstNonEmpty(event.TraceContext.ParentSpanID, runtimecontext.AgentSpanID(traceID, event.AgentID)), SpanKindLLM, "Final Answer", event.Type, event.Data, event.Error, timestamp)
@@ -146,6 +164,28 @@ func (c *Collector) OnAgentEvent(ctx agentcore.Context, event agentcore.AgentEve
 		base.Events = []SpanEvent{spanEvent(string(event.Type), event.Data, timestamp)}
 	}
 	c.upsert(ctxFor(ctx), base)
+}
+
+func spanKindForCapability(capabilityType string) SpanKind {
+	switch strings.ToLower(capabilityType) {
+	case "skill":
+		return SpanKindSkill
+	case "workflow":
+		return SpanKindWorkflow
+	default:
+		return SpanKindTool
+	}
+}
+
+func capabilitySpanName(kind SpanKind, capabilityID string) string {
+	switch kind {
+	case SpanKindSkill:
+		return "Skill " + capabilityID
+	case SpanKindWorkflow:
+		return "Workflow " + capabilityID
+	default:
+		return "Tool " + capabilityID
+	}
 }
 
 func (c *Collector) OnToolEvent(ctx context.Context, event toolscore.ToolEvent) {
@@ -216,18 +256,58 @@ func (c *Collector) handleChildAgentSpan(ctx context.Context, traceID, spanID, p
 	case agentcore.EventPlanningStarted, agentcore.EventModelStarted, agentcore.EventCapabilityStarted, agentcore.EventFinalAnswerStarted:
 		span.Status = SpanStatusRunning
 		span.StartedAt = timestamp
-		span.Input = c.redact(data)
+		span.Input = c.redact(traceInputForSpan(kind, data))
+		span.Attributes = mergeMap(span.Attributes, traceAttributesForSpan(kind, data))
 	case agentcore.EventPlanningCompleted, agentcore.EventModelCompleted, agentcore.EventCapabilityCompleted, agentcore.EventFinalAnswerCompleted:
 		span.Status = SpanStatusOK
 		span.FinishedAt = timestamp
-		span.Output = c.redact(data)
+		span.Output = c.redact(traceOutputForSpan(kind, data))
+		span.Attributes = mergeMap(span.Attributes, traceAttributesForSpan(kind, data))
 	case agentcore.EventPlanningFailed, agentcore.EventModelFailed, agentcore.EventCapabilityFailed, agentcore.EventFinalAnswerFailed:
 		span.Status = SpanStatusError
 		span.FinishedAt = timestamp
 		span.Error = errText
-		span.Output = c.redact(data)
+		span.Output = c.redact(traceOutputForSpan(kind, data))
+		span.Attributes = mergeMap(span.Attributes, traceAttributesForSpan(kind, data))
 	}
 	c.upsert(ctx, span)
+}
+
+func traceInputForSpan(kind SpanKind, data map[string]any) map[string]any {
+	if kind == SpanKindLLM {
+		if request, ok := mapFromAny(data["request"]); ok {
+			return request
+		}
+	}
+	return data
+}
+
+func traceOutputForSpan(kind SpanKind, data map[string]any) map[string]any {
+	if kind == SpanKindLLM {
+		if response, ok := mapFromAny(data["response"]); ok {
+			return response
+		}
+	}
+	return data
+}
+
+func traceAttributesForSpan(kind SpanKind, data map[string]any) map[string]any {
+	if kind != SpanKindLLM || data == nil {
+		return nil
+	}
+	out := map[string]any{}
+	for key, value := range data {
+		if key == "request" || key == "response" {
+			continue
+		}
+		out[key] = value
+	}
+	return out
+}
+
+func mapFromAny(value any) (map[string]any, bool) {
+	typed, ok := value.(map[string]any)
+	return typed, ok
 }
 
 func (c *Collector) upsert(ctx context.Context, span Span) {

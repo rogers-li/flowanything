@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   Background,
   Controls,
@@ -16,13 +16,15 @@ import {
   type NodeProps
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { assistantTextFromDebugResult, ChatBubble, runtimeProgressHeadline, TraceInspector, type DebugChatMessage } from "../components/AgentDebugChat";
+import { ChatBubble, runtimeProgressHeadline, TraceInspector, type DebugChatMessage } from "../components/AgentDebugChat";
 import { Badge } from "../components/Badge";
 import { FlowDeletableEdge } from "../components/FlowDeletableEdge";
 import { PromptRichEditor, type PromptAgentMention } from "../components/PromptRichEditor";
 import { ToolSelector } from "../components/ToolSelector";
-import { agentFlowRuntimeApi, defaultTenantId, orchestratorApi, platformApi } from "../lib/api";
-import { agents as mockAgents, skills as mockSkills, tools as mockTools } from "../lib/mockData";
+import { useConfigWorkspace } from "../platform/ConfigWorkspaceProvider";
+import { debugSessionApi, resourceApi, runHistoryApi, runtimeApiV2 } from "../platform/configApi";
+import type { AgentConfig, ConnectorConfig, RunRecord, SkillConfig, ToolConfig, WorkflowConfig, WorkflowRunResponse as RuntimeWorkflowRunResponse } from "../platform/configTypes";
+import { agentTraceFromTraceResponse } from "../platform/traceViewModel";
 import type {
   AgentFlowNodeType,
   AgentFlowRunResponse,
@@ -72,6 +74,9 @@ import {
   type NodeConfigRows
 } from "../features/workflows/domain";
 import { transformFunctionById, transformFunctionDefinitions } from "../features/workflows/transformFunctions";
+import { agentProfileFromConfig, skillSpecFromConfig, toolSpecFromConfig } from "../features/agents/configModel";
+import { connectorOperationFromConfig } from "../features/connectors/configModel";
+import { agentFlowFromWorkflowConfig, isAgentFlowWorkflowConfig, workflowConfigFromAgentFlow } from "../features/agentflows/configModel";
 
 type Notice = NoticeState;
 type AgentFlowPageMode = "list" | "editor";
@@ -214,15 +219,18 @@ function persistFlowTestSession(flow: AgentFlowSpec, sessionId: string, messages
 
   const flowKey = flowTestSessionFlowKey(flow);
   const now = new Date().toISOString();
+  const historyMessages = completedFlowTestMessagesForHistory(messages);
+  if (historyMessages.length === 0) return;
   const allSessions = readAllFlowTestSessions();
   const existing = allSessions.find((session) => session.flowKey === flowKey && session.sessionId === sessionId);
+  const messagesChanged = existing ? flowTestMessagesKey(existing.messages) !== flowTestMessagesKey(historyMessages) : true;
   const nextRecord: FlowTestSessionRecord = {
     createdAt: existing?.createdAt ?? now,
     flowKey,
     flowName: flow.name || flow.graph.name || "Untitled Agent Flow",
-    messages: messagesForHistory(messages),
+    messages: historyMessages,
     sessionId,
-    updatedAt: now
+    updatedAt: messagesChanged ? now : existing?.updatedAt ?? now
   };
 
   const merged = [
@@ -274,16 +282,55 @@ function messagesForHistory(messages: DebugChatMessage[]): DebugChatMessage[] {
   }));
 }
 
+function completedFlowTestMessagesForHistory(messages: DebugChatMessage[]): DebugChatMessage[] {
+  const compactMessages = messagesForHistory(messages).filter((message) => !isFlowProgressMessage(message));
+  let lastUserIndex = -1;
+  for (let index = compactMessages.length - 1; index >= 0; index -= 1) {
+    if (compactMessages[index]?.role === "user") {
+      lastUserIndex = index;
+      break;
+    }
+  }
+  if (lastUserIndex < 0) return [];
+  const hasAssistantAfterLastUser = compactMessages.slice(lastUserIndex + 1).some((message) => message.role === "assistant" && message.text.trim());
+  return hasAssistantAfterLastUser ? compactMessages : [];
+}
+
+function isFlowProgressMessage(message: DebugChatMessage): boolean {
+  if (message.role !== "assistant") return false;
+  if (message.pending) return true;
+  if ((message.liveEvents?.length ?? 0) > 0) return true;
+  const text = message.text.trim();
+  return (
+    text === "正在执行 Agent Flow..." ||
+    text === "正在执行Agent Flow" ||
+    text === "正在执行 Flow..." ||
+    text === "Agent Flow 执行完成。" ||
+    text === "Agent 正在处理..." ||
+    text === "处理完成。" ||
+    text.startsWith("正在分析请求") ||
+    text.startsWith("正在调用") ||
+    text.startsWith("计划调用") ||
+    text.startsWith("处理过程：")
+  );
+}
+
+function flowTestMessagesKey(messages: DebugChatMessage[]): string {
+  return JSON.stringify(messagesForHistory(messages));
+}
+
 type AgentFlowsPageProps = {
   onExit?: () => void;
 };
 
 export function AgentFlowsPage({ onExit }: AgentFlowsPageProps = {}) {
+  const workspace = useConfigWorkspace();
   const [pageMode, setPageMode] = useState<AgentFlowPageMode>("list");
   const [flows, setFlows] = useState<AgentFlowSpec[]>([]);
-  const [agents, setAgents] = useState<AgentProfile[]>(mockAgents);
-  const [skills, setSkills] = useState<SkillSpec[]>(mockSkills);
-  const [tools, setTools] = useState<ToolSpec[]>(() => mockTools.filter((tool) => tool.status === "enabled"));
+  const [workflowConfigs, setWorkflowConfigs] = useState<WorkflowConfig[]>([]);
+  const [agents, setAgents] = useState<AgentProfile[]>([]);
+  const [skills, setSkills] = useState<SkillSpec[]>([]);
+  const [tools, setTools] = useState<ToolSpec[]>([]);
   const [connectorOperations, setConnectorOperations] = useState<ConnectorOperation[]>([]);
   const [selectedFlow, setSelectedFlow] = useState<AgentFlowSpec>(() => createAgentFlowDraft());
   const [nodes, setNodes] = useState<AgentFlowCanvasNode[]>(() => flowToCanvasNodes(createAgentFlowDraft().graph));
@@ -294,6 +341,7 @@ export function AgentFlowsPage({ onExit }: AgentFlowsPageProps = {}) {
   const [flowTestSessions, setFlowTestSessions] = useState<FlowTestSessionRecord[]>([]);
   const [isFlowTestHistoryOpen, setIsFlowTestHistoryOpen] = useState(false);
   const [flowDebugSessionId, setFlowDebugSessionId] = useState(() => createClientID("flow_debug_session"));
+  const restoredFlowHistorySnapshotRef = useRef<{ messagesKey: string; sessionId: string } | null>(null);
   const [activeFlowTrace, setActiveFlowTrace] = useState<AgentTrace | null>(null);
   const [nodeTestInput, setNodeTestInput] = useState("帮我搜索一下今天的 AI 新闻，并总结重点");
   const [nodeTestMessages, setNodeTestMessages] = useState<DebugChatMessage[]>([]);
@@ -365,7 +413,7 @@ export function AgentFlowsPage({ onExit }: AgentFlowsPageProps = {}) {
 
   useEffect(() => {
     void loadInitialData();
-  }, []);
+  }, [workspace.activeBundleId]);
 
   useEffect(() => {
     resetNodeDebugSession();
@@ -376,40 +424,53 @@ export function AgentFlowsPage({ onExit }: AgentFlowsPageProps = {}) {
   }, [selectedFlow.graph.id, selectedFlow.id]);
 
   useEffect(() => {
+    const restoredSnapshot = restoredFlowHistorySnapshotRef.current;
+    if (
+      restoredSnapshot &&
+      restoredSnapshot.sessionId === flowDebugSessionId &&
+      restoredSnapshot.messagesKey === flowTestMessagesKey(flowTestMessages)
+    ) {
+      restoredFlowHistorySnapshotRef.current = null;
+      setFlowTestSessions(readFlowTestSessions(selectedFlow));
+      return;
+    }
     persistFlowTestSession(selectedFlow, flowDebugSessionId, flowTestMessages);
     setFlowTestSessions(readFlowTestSessions(selectedFlow));
   }, [flowDebugSessionId, flowTestMessages, selectedFlow.graph.id, selectedFlow.id, selectedFlow.name]);
 
   async function loadInitialData() {
-    const [flowResponse, agentResponse, skillResponse, toolResponse, connectorOperationResponse] = await Promise.allSettled([
-      platformApi.listAgentFlows("all"),
-      platformApi.listAgents(),
-      platformApi.listSkills(),
-      platformApi.listTools({ status: "enabled" }),
-      platformApi.listConnectorOperations()
-    ]);
-
-    if (flowResponse.status === "fulfilled") {
-      setFlows(flowResponse.value.items);
-    }
-    if (agentResponse.status === "fulfilled" && agentResponse.value.items.length > 0) {
-      setAgents(agentResponse.value.items);
-    }
-    if (skillResponse.status === "fulfilled" && skillResponse.value.items.length > 0) {
-      setSkills(skillResponse.value.items);
-    }
-    if (toolResponse.status === "fulfilled" && toolResponse.value.items.length > 0) {
-      setTools(toolResponse.value.items);
-    }
-    if (connectorOperationResponse.status === "fulfilled") {
-      setConnectorOperations(connectorOperationResponse.value.items);
+    if (!workspace.activeBundleId) {
+      setFlows([]);
+      setWorkflowConfigs([]);
+      setAgents([]);
+      setSkills([]);
+      setTools([]);
+      setConnectorOperations([]);
+      return;
     }
 
-    const failed = [flowResponse, agentResponse, skillResponse, toolResponse, connectorOperationResponse].some((result) => result.status === "rejected");
-    if (failed) {
+    try {
+      const [workflowResponse, agentResponse, skillResponse, toolResponse, connectorResponse] = await Promise.all([
+        resourceApi.listResourcesByKind<WorkflowConfig>(workspace.activeBundleId, "workflow"),
+        resourceApi.listResourcesByKind<AgentConfig>(workspace.activeBundleId, "agent"),
+        resourceApi.listResourcesByKind<SkillConfig>(workspace.activeBundleId, "skill"),
+        resourceApi.listResourcesByKind<ToolConfig>(workspace.activeBundleId, "tool"),
+        resourceApi.listResourcesByKind<ConnectorConfig>(workspace.activeBundleId, "connector")
+      ]);
+
+      const nextWorkflowConfigs = workflowResponse.items.map((item) => item.resource).filter(isAgentFlowWorkflowConfig);
+      setWorkflowConfigs(nextWorkflowConfigs);
+      setFlows(nextWorkflowConfigs.map(agentFlowFromWorkflowConfig));
+      setAgents(agentResponse.items.map((item) => agentProfileFromConfig(item.resource)));
+      setSkills(skillResponse.items.map((item) => skillSpecFromConfig(item.resource)));
+      setTools(toolResponse.items.map((item) => toolSpecFromConfig(item.resource)).filter((tool) => tool.status === "enabled"));
+      setConnectorOperations(
+        connectorResponse.items.flatMap((item) => (item.resource.operations ?? []).map((operation) => connectorOperationFromConfig(item.resource, operation)))
+      );
+    } catch (error) {
       setNotice({
         ok: false,
-        message: "Some Agent Flow resources failed to load. Available local resources are still selectable."
+        message: error instanceof Error ? error.message : "Failed to load Agent Flow resources."
       });
     }
   }
@@ -604,6 +665,9 @@ export function AgentFlowsPage({ onExit }: AgentFlowsPageProps = {}) {
 
   async function saveFlow(nextSelectedNodeId = selectedNodeId) {
     try {
+      if (!workspace.activeBundleId) {
+        throw new Error("No active config bundle selected.");
+      }
       if (selectedFlow.orchestrationMode === "supervisor") {
         const validationMessage = existingAgentLeafValidationMessage(nodes, edges);
         if (validationMessage) {
@@ -612,9 +676,11 @@ export function AgentFlowsPage({ onExit }: AgentFlowsPageProps = {}) {
         }
       }
       const normalized = withGraph(currentFlow, currentGraph);
-      const saved = normalized.id
-        ? await platformApi.updateAgentFlow(normalized)
-        : await platformApi.createAgentFlow(normalized);
+      const current = workflowConfigs.find((item) => item.id === normalized.id);
+      const config = workflowConfigFromAgentFlow(normalized, current, { agents, skills, tools });
+      await resourceApi.upsertResource(workspace.activeBundleId, "workflow", config);
+      const saved = agentFlowFromWorkflowConfig(config);
+      upsertWorkflowConfig(config);
       upsertFlow(saved);
       openFlow(saved, false, nextSelectedNodeId);
       setNotice({ ok: true, message: "Agent Flow saved." });
@@ -629,10 +695,22 @@ export function AgentFlowsPage({ onExit }: AgentFlowsPageProps = {}) {
     const saved = await saveFlow();
     if (!saved?.id) return;
     try {
-      const next =
-        status === "enabled"
-          ? await platformApi.enableAgentFlow(saved.id)
-          : await platformApi.disableAgentFlow(saved.id);
+      if (!workspace.activeBundleId) {
+        throw new Error("No active config bundle selected.");
+      }
+      const nextFlow = {
+        ...saved,
+        status,
+        graph: {
+          ...saved.graph,
+          status
+        }
+      };
+      const current = workflowConfigs.find((item) => item.id === nextFlow.id);
+      const config = workflowConfigFromAgentFlow(nextFlow, current, { agents, skills, tools });
+      await resourceApi.upsertResource(workspace.activeBundleId, "workflow", config);
+      const next = agentFlowFromWorkflowConfig(config);
+      upsertWorkflowConfig(config);
       upsertFlow(next);
       openFlow(next, false);
       setNotice({ ok: true, message: `Agent Flow ${status}.` });
@@ -645,13 +723,10 @@ export function AgentFlowsPage({ onExit }: AgentFlowsPageProps = {}) {
     if (isFlowRunning) return;
     setIsFlowRunning(true);
     const liveMessageId = createClientID("flow_chat_live");
-    const progressTraceId = createClientID("flow_progress_trace");
-    let latestProgressEvents: RuntimeEvent[] = [];
-    let stopLiveEvents = () => {};
+    const traceId = createClientID("flow_trace");
+    let stopFlowTracePolling = () => {};
     try {
       const submittedInput = flowTestInput;
-      // Flow tests exercise the latest operator-edited graph. Saving first also
-      // lets Platform API materialize Local Agent nodes into hidden Agent IDs.
       const saved = await saveFlow();
       if (!saved) return;
       const userText = submittedInput.trim();
@@ -665,55 +740,59 @@ export function AgentFlowsPage({ onExit }: AgentFlowsPageProps = {}) {
         }
       ]);
       const input = inputFromDebugText(submittedInput);
-      const liveFlow = withLiveAgentTraceIds(saved, flowDebugSessionId);
-      const liveTraceIds = collectAgentTraceIds(liveFlow);
-      const decorateRuntimeEvent = createRuntimeEventDecorator(liveFlow, agents, skills, tools);
-      stopLiveEvents = subscribeManyLiveEvents(liveTraceIds, (event) => {
-        if (event.type === "connected") return;
-        const decoratedEvent = decorateRuntimeEvent(event);
-        setFlowTestMessages((current) =>
-          current.map((message) => {
-            if (message.id !== liveMessageId) return message;
-            const liveEvents = [...(message.liveEvents ?? []), decoratedEvent];
-            latestProgressEvents = liveEvents;
-            return {
-              ...message,
-              text: liveDebugText(liveEvents),
-              liveEvents,
-              trace: buildRuntimeEventsTrace(progressTraceId, flowDebugSessionId, liveFlow.name, liveEvents)
-            };
-          })
-        );
-      });
-      const initialProgressTrace = buildRuntimeEventsTrace(progressTraceId, flowDebugSessionId, liveFlow.name, []);
+      const initialProgressTrace = buildRuntimeEventsTrace(traceId, flowDebugSessionId, saved.name, []);
       setFlowTestMessages((current) => [
         ...current,
         {
           id: liveMessageId,
           role: "assistant",
-          text: liveTraceIds.length > 0 ? "正在分析请求..." : "正在执行 Flow...",
-          traceId: progressTraceId,
+          text: "正在执行 Agent Flow...",
+          traceId,
           trace: initialProgressTrace,
           liveEvents: [],
           pending: true
         }
       ]);
-      const result = await agentFlowRuntimeApi.runAgentFlow(
-        liveFlow.orchestrationMode === "supervisor"
-          ? { flow: liveFlow, input }
-          : { graph: previewGraph(liveFlow.graph, liveFlow.name), input }
-      );
-      const trace = await buildFlowTraceFromRun(result, flowDebugSessionId);
-      setActiveFlowTrace((current) => (current?.traceId === progressTraceId ? trace : current));
+      stopFlowTracePolling = startFlowTracePolling(traceId, liveMessageId);
+      if (!workspace.activeBundleId) {
+        throw new Error("No active config bundle selected.");
+      }
+      const { session } = await debugSessionApi.createSession({
+        bundle_id: workspace.activeBundleId,
+        entrypoint: {
+          kind: "workflow",
+          id: saved.id
+        }
+      });
+      const runtimeResult =
+        saved.orchestrationMode === "supervisor"
+          ? await debugSessionApi.runAgentGraph(session.id, {
+              agent_flow_id: saved.id,
+              input,
+              trace_context: {
+                trace_id: traceId
+              }
+            })
+          : await debugSessionApi.runWorkflow(session.id, {
+              workflow_id: saved.id,
+              input,
+              trace_context: {
+                trace_id: traceId
+              }
+            });
+      const result = agentFlowRunResponseFromRuntime(saved.id, input, runtimeResult, traceId);
+      const trace = await loadRuntimeTraceOrFallback(traceId, result, flowDebugSessionId);
+      setActiveFlowTrace((current) => (current?.traceId === traceId ? trace : current));
       setFlowTestMessages((current) =>
         [
           ...current.map((message) =>
             message.id === liveMessageId
               ? {
                   ...message,
-                  text: processMessageText(message.liveEvents ?? []),
+                  text: "Agent Flow 执行完成。",
                   traceId: trace.traceId,
                   trace,
+                  liveEvents: runtimeEventsFromTrace(trace),
                   pending: false
                 }
               : message
@@ -733,8 +812,8 @@ export function AgentFlowsPage({ onExit }: AgentFlowsPageProps = {}) {
       });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : "Failed to run Agent Flow.";
-      const failedProgressTrace = buildRuntimeEventsTrace(progressTraceId, flowDebugSessionId, selectedFlow.name, latestProgressEvents, errorMessage);
-      setActiveFlowTrace((current) => (current?.traceId === progressTraceId ? failedProgressTrace : current));
+      const failedProgressTrace = buildRuntimeEventsTrace(traceId, flowDebugSessionId, selectedFlow.name, [], errorMessage);
+      setActiveFlowTrace((current) => (current?.traceId === traceId ? failedProgressTrace : current));
       setFlowTestMessages((current) =>
         current.some((message) => message.id === liveMessageId)
           ? current.map((message) =>
@@ -742,28 +821,67 @@ export function AgentFlowsPage({ onExit }: AgentFlowsPageProps = {}) {
                 ? {
                     ...message,
                     text: errorMessage,
-                    traceId: message.traceId ?? progressTraceId,
-                    trace: buildRuntimeEventsTrace(message.traceId ?? progressTraceId, flowDebugSessionId, selectedFlow.name, message.liveEvents ?? [], errorMessage),
+                    traceId: message.traceId ?? traceId,
+                    trace: buildRuntimeEventsTrace(message.traceId ?? traceId, flowDebugSessionId, selectedFlow.name, message.liveEvents ?? [], errorMessage),
                     pending: false
                   }
                 : message
             )
-          : [
-              ...current,
-              {
-                id: createClientID("flow_chat_error"),
-                role: "assistant",
-                text: errorMessage,
-                traceId: progressTraceId,
-                trace: failedProgressTrace
-              }
-            ]
+            : [
+                ...current,
+                {
+                  id: createClientID("flow_chat_error"),
+                  role: "assistant",
+                  text: errorMessage,
+                  traceId,
+                  trace: failedProgressTrace
+                }
+              ]
       );
       setNotice({ ok: false, message: errorMessage });
     } finally {
-      stopLiveEvents();
+      stopFlowTracePolling();
       setIsFlowRunning(false);
     }
+  }
+
+  function startFlowTracePolling(traceId: string, liveMessageId: string): () => void {
+    let stopped = false;
+    let timer: number | undefined;
+
+    const poll = async () => {
+      if (stopped) return;
+      try {
+        const trace = agentTraceFromTraceResponse(await runtimeApiV2.getTrace(traceId));
+        const liveEvents = runtimeEventsFromTrace(trace);
+        setActiveFlowTrace((current) => (current?.traceId === traceId ? trace : current));
+        setFlowTestMessages((current) =>
+          current.map((message) =>
+            message.id === liveMessageId && message.pending
+              ? {
+                  ...message,
+                  text: runtimeProgressHeadline(liveEvents),
+                  trace,
+                  liveEvents
+                }
+              : message
+          )
+        );
+      } catch {
+        // Trace spans are created asynchronously after the runtime receives the request.
+      }
+      if (!stopped) {
+        timer = window.setTimeout(poll, 900);
+      }
+    };
+
+    timer = window.setTimeout(poll, 400);
+    return () => {
+      stopped = true;
+      if (timer !== undefined) {
+        window.clearTimeout(timer);
+      }
+    };
   }
 
   function resetFlowDebugSession() {
@@ -773,9 +891,14 @@ export function AgentFlowsPage({ onExit }: AgentFlowsPageProps = {}) {
     setIsFlowTestHistoryOpen(false);
   }
 
-  function restoreFlowDebugSession(session: FlowTestSessionRecord) {
+  async function restoreFlowDebugSession(session: FlowTestSessionRecord) {
+    const restoredMessages = await restoreFlowTestMessages(selectedFlow, session);
+    restoredFlowHistorySnapshotRef.current = {
+      messagesKey: flowTestMessagesKey(restoredMessages),
+      sessionId: session.sessionId
+    };
     setFlowDebugSessionId(session.sessionId);
-    setFlowTestMessages(messagesForHistory(session.messages));
+    setFlowTestMessages(restoredMessages);
     setActiveFlowTrace(null);
     setIsFlowTestHistoryOpen(false);
   }
@@ -787,7 +910,7 @@ export function AgentFlowsPage({ onExit }: AgentFlowsPageProps = {}) {
 
   async function openFlowTraceById(traceId: string) {
     try {
-      openFlowTrace(await orchestratorApi.getTrace(traceId));
+      openFlowTrace(agentTraceFromTraceResponse(await runtimeApiV2.getTrace(traceId)));
     } catch (error) {
       setNotice({ ok: false, message: error instanceof Error ? error.message : "Failed to load flow trace." });
     }
@@ -800,7 +923,7 @@ export function AgentFlowsPage({ onExit }: AgentFlowsPageProps = {}) {
 
   async function openNodeTraceById(traceId: string) {
     try {
-      openNodeTrace(await orchestratorApi.getTrace(traceId));
+      openNodeTrace(agentTraceFromTraceResponse(await runtimeApiV2.getTrace(traceId)));
     } catch (error) {
       setNotice({ ok: false, message: error instanceof Error ? error.message : "Failed to load node trace." });
     }
@@ -816,26 +939,10 @@ export function AgentFlowsPage({ onExit }: AgentFlowsPageProps = {}) {
     setIsNodeRunning(true);
     const traceId = createClientID("trace");
     const liveMessageId = createClientID("flow_node_chat_live");
-    const decorateRuntimeEvent = createRuntimeEventDecorator(currentFlow, agents, skills, tools);
-    const stopLiveEvents = orchestratorApi.subscribeLiveEvents(traceId, (event) => {
-      if (event.type === "connected") return;
-      const decoratedEvent = decorateRuntimeEvent(event);
-      setNodeTestMessages((current) =>
-        current.map((message) => {
-          if (message.id !== liveMessageId) return message;
-          const liveEvents = [...(message.liveEvents ?? []), decoratedEvent];
-          return {
-            ...message,
-            text: liveDebugText(liveEvents),
-            liveEvents
-          };
-        })
-      );
-    });
     try {
       const agentID = await resolveNodeAgentIDForTest(selectedNode);
       if (!agentID) {
-        setNotice({ ok: false, message: "Select an Agent or save the Local Agent node before testing this node." });
+        setNotice({ ok: false, message: "Node-level test requires an Existing Agent. Local Agent nodes are tested through the whole Agent Flow." });
         return;
       }
       const userText = nodeTestInput.trim();
@@ -856,33 +963,36 @@ export function AgentFlowsPage({ onExit }: AgentFlowsPageProps = {}) {
           pending: true
         }
       ]);
-      const result = await orchestratorApi.handleEvent({
-        tenantId: defaultTenantId,
-        traceId,
-        agentId: agentID,
-        userId: "agent_flow_debug",
-        sessionId: nodeDebugSessionId,
-        type: "user_message_committed",
-        channel: "text",
-        payload: {
-          text: userText
+      if (!workspace.activeBundleId) {
+        throw new Error("No active config bundle selected.");
+      }
+      const { session } = await debugSessionApi.createSession({
+        bundle_id: workspace.activeBundleId,
+        entrypoint: {
+          kind: "agent",
+          id: agentID
+        }
+      });
+      const result = await debugSessionApi.runAgent(session.id, {
+        agent_id: agentID,
+        user_message: userText,
+        trace_context: {
+          trace_id: traceId
         }
       });
       let trace: AgentTrace | null = null;
-      if (result.traceId) {
-        try {
-          trace = await orchestratorApi.getTrace(result.traceId);
-        } catch {
-          trace = null;
-        }
+      try {
+        trace = agentTraceFromTraceResponse(await runtimeApiV2.getTrace(traceId));
+      } catch {
+        trace = null;
       }
       setNodeTestMessages((current) =>
         current.map((message) =>
           message.id === liveMessageId
             ? {
                 ...message,
-                text: assistantTextFromDebugResult(result),
-                traceId: result.traceId,
+                text: result.result.text,
+                traceId,
                 trace,
                 pending: false
               }
@@ -904,7 +1014,6 @@ export function AgentFlowsPage({ onExit }: AgentFlowsPageProps = {}) {
       );
       setNotice({ ok: false, message: error instanceof Error ? error.message : "Failed to test node agent." });
     } finally {
-      stopLiveEvents();
       setIsNodeRunning(false);
     }
   }
@@ -917,12 +1026,7 @@ export function AgentFlowsPage({ onExit }: AgentFlowsPageProps = {}) {
 
   async function resolveNodeAgentIDForTest(node: AgentFlowCanvasNode): Promise<string | undefined> {
     if (node.data.agentId) return node.data.agentId;
-    if (node.data.agentMode !== "local") return undefined;
-
-    const saved = await saveFlow(node.id);
-    const savedNode = saved?.graph.nodes[node.id];
-    const agentID = savedNode?.config?.agent_id;
-    return typeof agentID === "string" && agentID.trim() ? agentID : undefined;
+    return undefined;
   }
 
   function upsertFlow(flow: AgentFlowSpec) {
@@ -932,6 +1036,16 @@ export function AgentFlowsPage({ onExit }: AgentFlowsPageProps = {}) {
         return current.map((item) => (item.id === flow.id ? flow : item));
       }
       return [flow, ...current];
+    });
+  }
+
+  function upsertWorkflowConfig(config: WorkflowConfig) {
+    setWorkflowConfigs((current) => {
+      const exists = current.some((item) => item.id === config.id);
+      if (exists) {
+        return current.map((item) => (item.id === config.id ? config : item));
+      }
+      return [config, ...current];
     });
   }
 
@@ -1114,7 +1228,7 @@ export function AgentFlowsPage({ onExit }: AgentFlowsPageProps = {}) {
                       key={session.sessionId}
                       className={session.sessionId === flowDebugSessionId ? "flow-test-session-item is-active" : "flow-test-session-item"}
                       type="button"
-                      onClick={() => restoreFlowDebugSession(session)}
+                      onClick={() => void restoreFlowDebugSession(session)}
                     >
                       <strong>{flowTestSessionPreview(session.messages)}</strong>
                       <span>
@@ -1382,7 +1496,7 @@ function previewGraph(graph: ReturnType<typeof canvasToGraph>, flowName: string)
   return {
     ...graph,
     id: "flow_preview",
-    tenantId: defaultTenantId,
+    tenantId: "tenant_1",
     name: flowName || "Preview Flow"
   };
 }
@@ -1391,9 +1505,57 @@ function previewFlow(flow: AgentFlowSpec, graph: ReturnType<typeof canvasToGraph
   return {
     ...flow,
     id: flow.id || "flow_preview",
-    tenantId: defaultTenantId,
+    tenantId: "tenant_1",
     graph: previewGraph(graph, flow.name)
   };
+}
+
+function agentFlowRunResponseFromRuntime(
+  flowId: string,
+  input: Record<string, unknown>,
+  result: RuntimeWorkflowRunResponse,
+  traceId: string
+): AgentFlowRunResponse {
+  const now = new Date().toISOString();
+  return {
+    run: {
+      id: result.instance_id || createClientID("agent_flow_run"),
+      tenantId: "tenant_1",
+      flowId,
+      status: result.status === "failed" ? "failed" : result.status === "running" ? "running" : "succeeded",
+      input,
+      output: result.output,
+      startedAt: now,
+      finishedAt: result.status === "running" ? undefined : now
+    },
+    nodeRuns: []
+  };
+}
+
+async function loadRuntimeTraceOrFallback(traceId: string, result: AgentFlowRunResponse, sessionId: string): Promise<AgentTrace> {
+  try {
+    return agentTraceFromTraceResponse(await runtimeApiV2.getTrace(traceId));
+  } catch {
+    return buildFlowTraceFromRun(result, sessionId);
+  }
+}
+
+function runtimeEventsFromTrace(trace: AgentTrace): RuntimeEvent[] {
+  return trace.steps.map((step) => ({
+    id: step.id,
+    type: "trace_step_added",
+    tenantId: trace.tenantId,
+    traceId: trace.traceId,
+    sessionId: trace.sessionId,
+    stepId: step.id,
+    stepType: step.type,
+    name: step.name,
+    status: step.status,
+    payload: {
+      step
+    },
+    createdAt: step.startedAt
+  }));
 }
 
 async function buildFlowTraceFromRun(result: AgentFlowRunResponse, sessionId: string): Promise<AgentTrace> {
@@ -1514,7 +1676,7 @@ function buildRuntimeEventsTrace(traceId: string, sessionId: string, flowName: s
 
   return {
     traceId,
-    tenantId: defaultTenantId,
+    tenantId: "tenant_1",
     sessionId,
     status: error ? "failed" : "running",
     startedAt,
@@ -1590,7 +1752,7 @@ function runtimeEventStatus(event: RuntimeEvent): TraceStep["status"] {
 }
 
 function traceStepTypeFromString(value?: string): TraceStep["type"] {
-  if (value === "agent" || value === "skill" || value === "model" || value === "tool" || value === "workflow" || value === "connector") {
+  if (value === "agent" || value === "skill" || value === "model" || value === "tool" || value === "workflow" || value === "node" || value === "connector") {
     return value;
   }
   return "event";
@@ -1614,7 +1776,7 @@ function safeTraceIDPart(value: string): string {
 
 async function getTraceOrNull(traceId: string): Promise<AgentTrace | null> {
   try {
-    return await orchestratorApi.getTrace(traceId);
+    return agentTraceFromTraceResponse(await runtimeApiV2.getTrace(traceId));
   } catch {
     return null;
   }
@@ -1642,6 +1804,124 @@ function flowAssistantText(result: AgentFlowRunResponse): string {
     return JSON.stringify(result.run.output, null, 2);
   }
   return `Agent Flow run ${result.run.status}.`;
+}
+
+async function restoreFlowTestMessages(flow: AgentFlowSpec, session: FlowTestSessionRecord): Promise<DebugChatMessage[]> {
+  const localMessages = messagesForHistory(session.messages);
+  const completedLocalMessages = completedFlowTestMessagesForHistory(localMessages);
+  if (completedLocalMessages.length > 0) return completedLocalMessages;
+
+  const recoveredFromHistory = await recoverFlowTestMessagesFromRunHistory(flow, session);
+  if (recoveredFromHistory.length > 0) return recoveredFromHistory;
+
+  const recoveredFromTrace = await recoverFlowTestMessagesFromTrace(session, localMessages);
+  return recoveredFromTrace.length > 0 ? recoveredFromTrace : localMessages;
+}
+
+async function recoverFlowTestMessagesFromRunHistory(flow: AgentFlowSpec, session: FlowTestSessionRecord): Promise<DebugChatMessage[]> {
+  try {
+    const { items } = await runHistoryApi.list();
+    const records = items
+      .filter((record) => runRecordMatchesFlowSession(record, flow, session))
+      .sort((left, right) => (left.started_at || "").localeCompare(right.started_at || ""));
+    const messages = records.flatMap((record) => flowTestMessagesFromRunRecord(record));
+    return completedFlowTestMessagesForHistory(messages);
+  } catch {
+    return [];
+  }
+}
+
+function runRecordMatchesFlowSession(record: RunRecord, flow: AgentFlowSpec, session: FlowTestSessionRecord): boolean {
+  if (record.session_id !== session.sessionId) return false;
+  const flowIDs = new Set([flow.id, flow.graph.id].filter(Boolean));
+  const entrypointID = record.entrypoint?.id || record.workflow_request?.workflow_id;
+  return !entrypointID || flowIDs.size === 0 || flowIDs.has(entrypointID);
+}
+
+function flowTestMessagesFromRunRecord(record: RunRecord): DebugChatMessage[] {
+  const userText = flowUserTextFromRunRecord(record);
+  const assistantText = flowAssistantTextFromRunRecord(record);
+  const messages: DebugChatMessage[] = [];
+  if (userText) {
+    messages.push({
+      id: `flow_history_user_${record.id}`,
+      role: "user",
+      text: userText
+    });
+  }
+  if (assistantText) {
+    messages.push({
+      id: `flow_history_assistant_${record.id}`,
+      role: "assistant",
+      text: assistantText,
+      traceId: record.trace_id
+    });
+  }
+  return messages;
+}
+
+function flowUserTextFromRunRecord(record: RunRecord): string {
+  const agentMessage = record.agent_request?.user_message?.trim();
+  if (agentMessage) return agentMessage;
+  const input = record.workflow_request?.input ?? {};
+  for (const key of ["user_request", "message", "text", "query", "task", "prompt"]) {
+    const value = stringFromRecord(input, key);
+    if (value) return value;
+  }
+  return Object.keys(input).length > 0 ? JSON.stringify(input, null, 2) : "";
+}
+
+function flowAssistantTextFromRunRecord(record: RunRecord): string {
+  const resultText = assistantTextFromUnknown(record.result);
+  if (resultText) return resultText;
+  return record.error ? `Agent Flow 执行失败：${record.error}` : "";
+}
+
+async function recoverFlowTestMessagesFromTrace(session: FlowTestSessionRecord, localMessages: DebugChatMessage[]): Promise<DebugChatMessage[]> {
+  const traceId = [...localMessages].reverse().find((message) => message.traceId)?.traceId;
+  if (!traceId) return [];
+  const trace = await getTraceOrNull(traceId);
+  if (!trace) return [];
+  const assistantText = flowAssistantTextFromTrace(trace);
+  if (!assistantText) return [];
+  const userMessage = [...localMessages].reverse().find((message) => message.role === "user");
+  return [
+    ...(userMessage ? [userMessage] : []),
+    {
+      id: `flow_history_assistant_${session.sessionId}_${traceId}`,
+      role: "assistant",
+      text: assistantText,
+      traceId,
+      trace
+    }
+  ];
+}
+
+function flowAssistantTextFromTrace(trace: AgentTrace): string {
+  const outputBearingSteps = [...trace.steps].reverse();
+  for (const step of outputBearingSteps) {
+    const metadata = step.metadata ?? {};
+    const responseText = assistantTextFromUnknown(metadata.response);
+    if (responseText) return responseText;
+    const outputText = assistantTextFromUnknown(metadata.output);
+    if (outputText) return outputText;
+  }
+  return trace.error ? `Agent Flow 执行失败：${trace.error}` : "";
+}
+
+function assistantTextFromUnknown(value: unknown): string {
+  if (typeof value === "string") return value.trim();
+  const record = recordFromUnknown(value);
+  const output = recordFromUnknown(record.output);
+  const result = recordFromUnknown(record.result);
+  const data = recordFromUnknown(record.data);
+  for (const candidate of [output, result, data, record]) {
+    for (const key of ["return_message", "text", "answer", "message", "final_answer", "result"]) {
+      const text = stringFromRecord(candidate, key);
+      if (text) return text;
+    }
+  }
+  return "";
 }
 
 function sortedNodeRuns(nodeRuns: AgentFlowRunResponse["nodeRuns"]): AgentFlowRunResponse["nodeRuns"] {
@@ -3594,9 +3874,4 @@ function firstRuntimeString(...values: unknown[]): string {
     if (typeof value === "string" && value.trim()) return value.trim();
   }
   return "";
-}
-
-function subscribeManyLiveEvents(traceIds: string[], onEvent: (event: RuntimeEvent) => void): () => void {
-  const stops = Array.from(new Set(traceIds)).map((traceId) => orchestratorApi.subscribeLiveEvents(traceId, onEvent));
-  return () => stops.forEach((stop) => stop());
 }

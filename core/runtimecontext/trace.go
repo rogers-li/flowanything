@@ -11,10 +11,10 @@ const traceContextKey contextKey = "flow-anything.runtime.trace-context"
 // agents, tools, and connectors can propagate trace identity without depending
 // on a concrete tracing implementation.
 type TraceContext struct {
-	TraceID       string
-	SpanID        string
-	ParentSpanID  string
-	CorrelationID string
+	TraceID       string `json:"trace_id,omitempty"`
+	SpanID        string `json:"span_id,omitempty"`
+	ParentSpanID  string `json:"parent_span_id,omitempty"`
+	CorrelationID string `json:"correlation_id,omitempty"`
 }
 
 func WithTraceContext(ctx context.Context, traceContext TraceContext) context.Context {

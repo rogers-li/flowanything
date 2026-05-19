@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"flow-anything/core/agentcore"
 	"flow-anything/core/flowengine"
@@ -52,7 +53,7 @@ func (e AgentNodeExecutor) Execute(ctx context.Context, req flowengine.NodeReque
 		Input:        req.Input,
 		Message:      message,
 		Metadata:     config.Metadata,
-		TraceContext: traceContextFrom(ctx),
+		TraceContext: childTraceContextFrom(ctx),
 	})
 	if err != nil {
 		return flowengine.NodeResult{}, err
@@ -61,15 +62,73 @@ func (e AgentNodeExecutor) Execute(ctx context.Context, req flowengine.NodeReque
 	if output == nil {
 		output = map[string]any{}
 	}
-	if result.Text != "" {
-		output["text"] = result.Text
+	text := agentOutputText(output, result.Text)
+	if text != "" {
+		output["text"] = text
 	}
 	if req.Context != nil {
 		_ = req.Context.WriteNodeContext("agent", "runs."+config.Agent.ID, map[string]any{
 			"output": output,
-			"text":   result.Text,
+			"text":   text,
 			"raw":    result.Raw,
 		})
 	}
-	return flowengine.NodeResult{Output: output, NextNodeIDs: result.NextNodeIDs}, nil
+	nextNodeIDs := result.NextNodeIDs
+	if agentRoutingMode(config.Metadata) == "agent_directed" {
+		nextNodeIDs = selectedNextNodeIDs(req.Flow, req.Node.ID, output["next_node_ids"])
+	}
+	return flowengine.NodeResult{Output: output, NextNodeIDs: nextNodeIDs}, nil
+}
+
+func agentOutputText(output map[string]any, fallback string) string {
+	for _, key := range []string{"text", "return_message", "answer", "message", "final_answer", "result"} {
+		if value, ok := output[key].(string); ok && strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return fallback
+}
+
+func agentRoutingMode(metadata map[string]any) string {
+	if metadata == nil {
+		return ""
+	}
+	return strings.TrimSpace(fmt.Sprint(metadata["agent_routing_mode"]))
+}
+
+func selectedNextNodeIDs(flow flowengine.FlowSpec, nodeID string, value any) []string {
+	allowed := map[string]struct{}{}
+	for _, edge := range flow.Edges {
+		if edge.From == nodeID && edge.To != "" {
+			allowed[edge.To] = struct{}{}
+		}
+	}
+	if len(allowed) == 0 {
+		return []string{}
+	}
+	selected := []string{}
+	for _, id := range stringListValue(value) {
+		if _, ok := allowed[id]; ok {
+			selected = append(selected, id)
+		}
+	}
+	return selected
+}
+
+func stringListValue(value any) []string {
+	switch typed := value.(type) {
+	case []string:
+		return typed
+	case []any:
+		out := make([]string, 0, len(typed))
+		for _, item := range typed {
+			text := strings.TrimSpace(fmt.Sprint(item))
+			if text != "" {
+				out = append(out, text)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
 }

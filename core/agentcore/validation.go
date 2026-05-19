@@ -63,6 +63,15 @@ func parseAndValidateFinalOutput(agent AgentSpec, content string) (map[string]an
 	return output, nil
 }
 
+func finalTextFromOutput(content string, output map[string]any) string {
+	for _, key := range []string{"text", "return_message", "answer", "message", "final_answer", "result"} {
+		if value, ok := output[key].(string); ok && strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return content
+}
+
 func parseJSONObject(content string) (map[string]any, error) {
 	content = strings.TrimSpace(content)
 	content = strings.TrimPrefix(content, "```json")

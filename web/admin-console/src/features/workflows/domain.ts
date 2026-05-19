@@ -284,7 +284,9 @@ function schemaPropertiesFromContextFields(fields: Array<{ path: string; type: s
   const properties: Record<string, Record<string, unknown>> = {};
   const required: string[] = [];
 
-  for (const field of fields) {
+  const fieldsByDepth = [...fields].sort((left, right) => pathDepth(left.path) - pathDepth(right.path));
+
+  for (const field of fieldsByDepth) {
     const parts = field.path
       .split(".")
       .map((part) => part.trim())
@@ -304,15 +306,7 @@ function schemaPropertiesFromContextFields(fields: Array<{ path: string; type: s
         return;
       }
 
-      const existing = currentProperties[part];
-      const objectSchema =
-        existing && existing.type === "object"
-          ? existing
-          : {
-              type: "object",
-              properties: {},
-              required: []
-            };
+      const objectSchema = ensureObjectSchema(currentProperties[part]);
       currentProperties[part] = objectSchema;
       currentProperties = objectSchema.properties as Record<string, Record<string, unknown>>;
       currentRequired = objectSchema.required as string[];
@@ -320,6 +314,25 @@ function schemaPropertiesFromContextFields(fields: Array<{ path: string; type: s
   }
 
   return { properties, required };
+}
+
+function pathDepth(path: string): number {
+  return path.split(".").filter((part) => part.trim()).length;
+}
+
+function ensureObjectSchema(value: unknown): Record<string, unknown> {
+  const base = value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+  const nestedProperties =
+    base.properties && typeof base.properties === "object" && !Array.isArray(base.properties)
+      ? (base.properties as Record<string, Record<string, unknown>>)
+      : {};
+  const nestedRequired = Array.isArray(base.required) ? base.required.filter((item): item is string => typeof item === "string") : [];
+  return {
+    ...base,
+    type: "object",
+    properties: nestedProperties,
+    required: nestedRequired
+  };
 }
 
 export function nodeTypeLabel(type: WorkflowNodeType): string {

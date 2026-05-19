@@ -76,8 +76,11 @@ main() {
   },
   "auth": {
     "type": "api_key",
-    "header_name": "query:key",
-    "secret_ref": "env:JUHE_NEWS_API_KEY"
+    "secret_ref": "env:JUHE_NEWS_API_KEY",
+    "config": {
+      "in": "query",
+      "name": "key"
+    }
   },
   "timeout_ms": 15000,
   "version": "v1"

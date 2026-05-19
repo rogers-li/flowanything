@@ -172,7 +172,7 @@ export type RuntimeEvent = {
   createdAt?: string;
 };
 
-export type TraceStepType = "event" | "agent" | "skill" | "model" | "tool" | "workflow" | "connector";
+export type TraceStepType = "event" | "agent" | "skill" | "model" | "tool" | "workflow" | "node" | "connector";
 
 export type TraceStep = {
   id: string;
@@ -565,6 +565,7 @@ export type ConnectorOperation = {
     type: "none" | "api_key" | "bearer" | "basic" | "oauth2";
     headerName?: string;
     secretRef?: string;
+    config?: Record<string, unknown>;
   };
   inputSchema?: Record<string, unknown>;
   outputSchema?: Record<string, unknown>;
@@ -587,6 +588,7 @@ export type Connector = {
     type: "none" | "api_key" | "bearer" | "basic" | "oauth2";
     headerName?: string;
     secretRef?: string;
+    config?: Record<string, unknown>;
   };
   timeoutMillis: number;
   version?: string;

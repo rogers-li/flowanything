@@ -1,10 +1,11 @@
 import { Badge } from "../components/Badge";
 import { DataTable } from "../components/DataTable";
 import { PageHeader } from "../components/PageHeader";
-import { modelProviders } from "../lib/mockData";
+import { useModelProviders } from "../features/models/useModelProviders";
 import type { ModelProvider } from "../types/platform";
 
 export function ModelGatewayPage() {
+  const modelProviders = useModelProviders();
   return (
     <div className="page-stack">
       <PageHeader

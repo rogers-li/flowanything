@@ -42,6 +42,47 @@ func (r *MapCapabilityRegistry) List() []CapabilityDescriptor {
 	return out
 }
 
+// CompositeCapabilityRegistry overlays multiple registries. Earlier registries
+// take precedence, which lets a graph node expose local Sub-Agent capabilities
+// without mutating the shared platform registry.
+type CompositeCapabilityRegistry struct {
+	registries []CapabilityRegistry
+}
+
+func NewCompositeCapabilityRegistry(registries ...CapabilityRegistry) *CompositeCapabilityRegistry {
+	out := make([]CapabilityRegistry, 0, len(registries))
+	for _, registry := range registries {
+		if registry != nil {
+			out = append(out, registry)
+		}
+	}
+	return &CompositeCapabilityRegistry{registries: out}
+}
+
+func (r *CompositeCapabilityRegistry) Get(id string) (Capability, bool) {
+	for _, registry := range r.registries {
+		if capability, ok := registry.Get(id); ok {
+			return capability, true
+		}
+	}
+	return nil, false
+}
+
+func (r *CompositeCapabilityRegistry) List() []CapabilityDescriptor {
+	seen := map[string]struct{}{}
+	out := []CapabilityDescriptor{}
+	for _, registry := range r.registries {
+		for _, descriptor := range registry.List() {
+			if _, exists := seen[descriptor.ID]; exists {
+				continue
+			}
+			seen[descriptor.ID] = struct{}{}
+			out = append(out, descriptor)
+		}
+	}
+	return out
+}
+
 // CapabilityFunc adapts a function into a Capability.
 type CapabilityFunc struct {
 	Desc CapabilityDescriptor
@@ -73,6 +114,7 @@ func NewDefaultStrategyRegistry() *StrategyRegistry {
 	registry := NewStrategyRegistry()
 	_ = registry.Register(DirectStrategy{})
 	_ = registry.Register(ActionPlanningStrategy{})
+	_ = registry.Register(ReWOOStrategy{})
 	_ = registry.Register(ReActStrategy{})
 	return registry
 }

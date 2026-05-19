@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"flow-anything/core/flowengine"
 )
@@ -110,15 +111,24 @@ func (RemoveFieldsTransform) Validate(config TransformNodeConfig) error {
 	return err
 }
 func (RemoveFieldsTransform) Apply(_ context.Context, input map[string]any, config TransformNodeConfig) (map[string]any, error) {
-	fields, err := stringSliceArg(config.Args, "fields")
+	fields, err := transformStringSliceArg(input, config.Args, "fields")
 	if err != nil {
 		return nil, err
 	}
-	output := cloneMap(input)
-	for _, field := range fields {
-		deleteNested(output, field)
+	value, ok := input["value"]
+	if !ok {
+		value = input
 	}
-	return output, nil
+	result := cloneTransformValue(value)
+	removedPaths := make([]string, 0)
+	for _, field := range fields {
+		removedPaths = append(removedPaths, removeFieldFromValue(result, strings.TrimSpace(field), "")...)
+	}
+	return map[string]any{
+		"result":        result,
+		"removed_count": len(removedPaths),
+		"removed_paths": removedPaths,
+	}, nil
 }
 
 type StringConcatTransform struct{}
@@ -127,6 +137,97 @@ func (StringConcatTransform) Name() string { return "string.concat" }
 func (StringConcatTransform) Validate(config TransformNodeConfig) error {
 	_, err := stringSliceArg(config.Args, "fields")
 	return err
+}
+
+func transformStringSliceArg(input map[string]any, args map[string]any, key string) ([]string, error) {
+	if args != nil {
+		if _, ok := args[key]; ok {
+			return stringSliceArg(args, key)
+		}
+	}
+	return stringSliceArg(input, key)
+}
+
+func cloneTransformValue(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		cloned := make(map[string]any, len(typed))
+		for key, child := range typed {
+			cloned[key] = cloneTransformValue(child)
+		}
+		return cloned
+	case []any:
+		cloned := make([]any, len(typed))
+		for index, child := range typed {
+			cloned[index] = cloneTransformValue(child)
+		}
+		return cloned
+	default:
+		return typed
+	}
+}
+
+func removeFieldFromValue(value any, field string, prefix string) []string {
+	if field == "" {
+		return nil
+	}
+	switch typed := value.(type) {
+	case map[string]any:
+		if strings.Contains(field, ".") {
+			if removed := removeNestedField(typed, field); removed {
+				return []string{joinPath(prefix, field)}
+			}
+			return nil
+		}
+		removed := make([]string, 0)
+		if _, ok := typed[field]; ok {
+			delete(typed, field)
+			removed = append(removed, joinPath(prefix, field))
+		}
+		for key, child := range typed {
+			removed = append(removed, removeFieldFromValue(child, field, joinPath(prefix, key))...)
+		}
+		return removed
+	case []any:
+		removed := make([]string, 0)
+		for index, child := range typed {
+			removed = append(removed, removeFieldFromValue(child, field, joinPath(prefix, fmt.Sprint(index)))...)
+		}
+		return removed
+	default:
+		return nil
+	}
+}
+
+func removeNestedField(data map[string]any, path string) bool {
+	parts := splitPath(path)
+	if len(parts) == 0 {
+		return false
+	}
+	current := data
+	for _, part := range parts[:len(parts)-1] {
+		next, ok := current[part].(map[string]any)
+		if !ok {
+			return false
+		}
+		current = next
+	}
+	leaf := parts[len(parts)-1]
+	if _, ok := current[leaf]; !ok {
+		return false
+	}
+	delete(current, leaf)
+	return true
+}
+
+func joinPath(prefix string, part string) string {
+	if prefix == "" {
+		return part
+	}
+	if part == "" {
+		return prefix
+	}
+	return prefix + "." + part
 }
 func (StringConcatTransform) Apply(_ context.Context, input map[string]any, config TransformNodeConfig) (map[string]any, error) {
 	fields, err := stringSliceArg(config.Args, "fields")

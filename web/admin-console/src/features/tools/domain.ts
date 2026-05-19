@@ -17,6 +17,9 @@ export type ToolDraft = {
   knowledgeBaseIds: string;
   pythonPackageId: string;
   mcpServerId: string;
+  mcpServerUrl: string;
+  mcpTransport: "streamable_http" | "sse" | string;
+  mcpHeaders: Record<string, string>;
   mcpToolName: string;
   workflowId: string;
   inputFields: SchemaFieldDraft[];
@@ -56,6 +59,9 @@ export function createToolDraft(): ToolDraft {
     knowledgeBaseIds: "",
     pythonPackageId: "",
     mcpServerId: "",
+    mcpServerUrl: "",
+    mcpTransport: "streamable_http",
+    mcpHeaders: {},
     mcpToolName: "",
     workflowId: "",
     inputFields: [createSchemaField({ name: "order_id", required: true, description: "Order identifier." })],
@@ -139,6 +145,9 @@ export function draftFromTool(tool: ToolSpec): ToolDraft {
     knowledgeBaseIds: (tool.binding?.knowledgeBaseIds ?? []).join(", "),
     pythonPackageId: tool.binding?.pythonPackageId ?? "",
     mcpServerId: tool.binding?.mcpServerId ?? "",
+    mcpServerUrl: tool.binding?.mcpServerUrl ?? "",
+    mcpTransport: tool.binding?.mcpTransport ?? "streamable_http",
+    mcpHeaders: tool.binding?.mcpHeaders ?? {},
     mcpToolName: tool.binding?.mcpToolName ?? "",
     workflowId: tool.binding?.workflowId ?? "",
     inputFields: fieldsFromSchema(tool.inputSchema),
@@ -220,6 +229,9 @@ function bindingFromDraft(draft: ToolDraft): ToolSpec["binding"] {
         : undefined,
     pythonPackageId: draft.implementation === "python" ? draft.pythonPackageId.trim() : undefined,
     mcpServerId: draft.implementation === "mcp" ? draft.mcpServerId.trim() : undefined,
+    mcpServerUrl: draft.implementation === "mcp" ? draft.mcpServerUrl.trim() : undefined,
+    mcpTransport: draft.implementation === "mcp" ? draft.mcpTransport : undefined,
+    mcpHeaders: draft.implementation === "mcp" ? draft.mcpHeaders : undefined,
     mcpToolName: draft.implementation === "mcp" ? draft.mcpToolName.trim() : undefined,
     workflowId: draft.implementation === "workflow" ? draft.workflowId.trim() : undefined
   };

@@ -36,9 +36,10 @@ type AppShellProps = {
   activeSection: SectionKey;
   onNavigate: (section: SectionKey) => void;
   children: ReactNode;
+  workspaceStatus?: ReactNode;
 };
 
-export function AppShell({ activeSection, onNavigate, children }: AppShellProps) {
+export function AppShell({ activeSection, onNavigate, children, workspaceStatus }: AppShellProps) {
   return (
     <div className="console-shell">
       <a className="skip-link" href="#main-content">
@@ -73,11 +74,11 @@ export function AppShell({ activeSection, onNavigate, children }: AppShellProps)
           ))}
         </nav>
 
-        <div className="sidebar-status" aria-label="Environment status">
-          <span>Tenant tenant_1</span>
-          <strong>Local MVP</strong>
-          <small>Platform console active</small>
-        </div>
+        {workspaceStatus ? (
+          <div className="sidebar-status" aria-label="Workspace status">
+            {workspaceStatus}
+          </div>
+        ) : null}
       </aside>
 
       <main id="main-content" className="console-main">

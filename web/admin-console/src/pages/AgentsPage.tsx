@@ -5,8 +5,9 @@ import { PromptRichEditor } from "../components/PromptRichEditor";
 import { ToolSelector } from "../components/ToolSelector";
 import { toggleSkill, toggleTool } from "../features/agents/domain";
 import { useAgents } from "../features/agents/useAgents";
-import { orchestratorApi } from "../lib/api";
-import { modelProviders } from "../lib/mockData";
+import { inferProviderIdFromModelProviders, useModelProviders } from "../features/models/useModelProviders";
+import { runtimeApiV2 } from "../platform/configApi";
+import { agentTraceFromTraceResponse } from "../platform/traceViewModel";
 import type { AgentProfile, AgentTrace, SkillSpec } from "../types/platform";
 
 const statusTone = {
@@ -42,6 +43,7 @@ function debugSessionPreview(messages: Array<{ role: string; text: string }>): s
 }
 
 export function AgentsPage() {
+  const modelProviders = useModelProviders();
   const [view, setView] = useState<AgentView>("list");
   const [openConfigSections, setOpenConfigSections] = useState<ConfigSectionKey[]>([]);
   const [configCollapsed, setConfigCollapsed] = useState(false);
@@ -102,7 +104,7 @@ export function AgentsPage() {
     setDraft({
       ...draft,
       model,
-      modelProviderId: inferProviderIdFromModel(model) ?? draft.modelProviderId
+      modelProviderId: inferProviderIdFromModelProviders(model, modelProviders) ?? draft.modelProviderId
     });
   };
 
@@ -133,7 +135,7 @@ export function AgentsPage() {
   };
   const openTraceById = async (traceId: string) => {
     try {
-      setActiveTrace(await orchestratorApi.getTrace(traceId));
+      setActiveTrace(agentTraceFromTraceResponse(await runtimeApiV2.getTrace(traceId)));
     } catch {
       // The run may still be starting or the trace may have expired; keep the chat usable.
     }
@@ -573,22 +575,4 @@ function initials(name: string): string {
   if (parts.length === 0) return "A";
   if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
   return `${parts[0][0]}${parts[1][0]}`.toUpperCase();
-}
-
-function inferProviderIdFromModel(model: string): string | undefined {
-  const normalized = model.trim().toLowerCase();
-  if (!normalized) return undefined;
-
-  const provider = modelProviders.find((item) => {
-    const providerType = item.type.toLowerCase();
-    return (
-      item.id.toLowerCase() === normalized ||
-      item.name.toLowerCase() === normalized ||
-      item.defaultModel.toLowerCase() === normalized ||
-      providerType === normalized ||
-      normalized.startsWith(`${providerType}-`)
-    );
-  });
-
-  return provider?.id;
 }

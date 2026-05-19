@@ -1,8 +1,9 @@
 import type { Edge, Node } from "@xyflow/react";
 import { MarkerType } from "@xyflow/react";
 import type { FlowDeletableEdgeData } from "../../components/FlowDeletableEdge";
-import { defaultTenantId } from "../../lib/api";
 import type { AgentFlowEdge, AgentFlowGraph, AgentFlowNode, AgentFlowNodeType, AgentFlowSpec } from "../../types/platform";
+
+const tenantId = "tenant_1";
 
 export type LocalAgentConfig = {
   name: string;
@@ -75,7 +76,7 @@ export function createAgentFlowDraft(): AgentFlowSpec {
   const graph = createDefaultGraph("", "Untitled Agent Flow", "Draft multi-agent orchestration flow.");
   return {
     id: "",
-    tenantId: defaultTenantId,
+    tenantId,
     name: graph.name,
     description: graph.description,
     businessDomain: "General",
@@ -143,7 +144,7 @@ export function createSupervisorAgentFlowDraft(): AgentFlowSpec {
 export function createDefaultGraph(flowId: string, name: string, description = ""): AgentFlowGraph {
   return {
     id: flowId,
-    tenantId: defaultTenantId,
+    tenantId,
     name,
     description,
     status: "draft",

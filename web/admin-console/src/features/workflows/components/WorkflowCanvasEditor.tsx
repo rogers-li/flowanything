@@ -21,7 +21,10 @@ import "@xyflow/react/dist/style.css";
 import { ChatBubble, TraceInspector, type DebugChatMessage } from "../../../components/AgentDebugChat";
 import { Badge } from "../../../components/Badge";
 import { FlowDeletableEdge, type FlowDeletableEdgeData } from "../../../components/FlowDeletableEdge";
-import { workflowRuntimeApi } from "../../../lib/api";
+import { useConfigWorkspace } from "../../../platform/ConfigWorkspaceProvider";
+import { debugSessionApi, runHistoryApi, runtimeApiV2 } from "../../../platform/configApi";
+import type { RunRecord, WorkflowRunResponse as RuntimeWorkflowRunResponse } from "../../../platform/configTypes";
+import { agentTraceFromTraceResponse } from "../../../platform/traceViewModel";
 import type {
   AgentTrace,
   AgentProfile,
@@ -148,6 +151,7 @@ export function WorkflowCanvasEditor({
   tools,
   workflow
 }: WorkflowCanvasEditorProps) {
+  const workspace = useConfigWorkspace();
   const [workflowName, setWorkflowName] = useState(workflow.name || "Untitled Workflow");
   const [nodes, setNodes] = useState<WorkflowCanvasNode[]>(() => workflowToCanvasNodes(workflow));
   const [edges, setEdges] = useState<WorkflowCanvasEdge[]>(() => workflowToCanvasEdges(workflow));
@@ -160,6 +164,7 @@ export function WorkflowCanvasEditor({
   const [workflowTestInput, setWorkflowTestInput] = useState(() => JSON.stringify(defaultWorkflowInput(contextFieldsFromSchema(workflow.inputSchema)), null, 2));
   const [workflowTestMessages, setWorkflowTestMessages] = useState<DebugChatMessage[]>([]);
   const [workflowRunHistory, setWorkflowRunHistory] = useState<WorkflowRun[]>([]);
+  const [workflowHistoryOpen, setWorkflowHistoryOpen] = useState(false);
   const [activeWorkflowTrace, setActiveWorkflowTrace] = useState<AgentTrace | null>(null);
   const [workflowRunning, setWorkflowRunning] = useState(false);
   const [nodeConfigExpanded, setNodeConfigExpanded] = useState(false);
@@ -358,29 +363,46 @@ export function WorkflowCanvasEditor({
 
   const loadWorkflowRunHistory = async () => {
     try {
-      const resp = await workflowRuntimeApi.listRuns({ workflowId: workflow.id, limit: 12 });
-      setWorkflowRunHistory(resp.items);
+      const resp = await runHistoryApi.list();
+      setWorkflowRunHistory(
+        resp.items
+          .filter((run) => run.type === "workflow" && runWorkflowId(run) === workflow.id)
+          .slice(0, 12)
+          .map((run) => workflowRunFromRecord(run, workflow.id))
+      );
     } catch {
       setWorkflowRunHistory([]);
     }
   };
 
-  const appendWorkflowResult = (result: WorkflowRunResponse) => {
-    const trace = buildWorkflowTraceFromRun(result);
+  const appendWorkflowResult = (result: WorkflowRunResponse, trace?: AgentTrace) => {
+    const nextTrace = trace ?? buildWorkflowTraceFromRun(result);
     const assistantMessage: DebugChatMessage = {
       id: `workflow_test_assistant_${result.run.id}`,
       role: "assistant",
       text: workflowRunText(result),
-      traceId: trace.traceId,
-      trace
+      traceId: nextTrace.traceId,
+      trace: nextTrace
     };
     setWorkflowTestMessages((current) => [...current, assistantMessage]);
-    setActiveWorkflowTrace(trace);
+    setActiveWorkflowTrace(nextTrace);
+  };
+
+  const loadTraceForRun = async (result: WorkflowRunResponse): Promise<AgentTrace> => {
+    if (!result.run.traceId) {
+      return buildWorkflowTraceFromRun(result);
+    }
+    try {
+      return agentTraceFromTraceResponse(await runtimeApiV2.getTrace(result.run.traceId));
+    } catch {
+      return buildWorkflowTraceFromRun(result);
+    }
   };
 
   const openWorkflowHistoryRun = async (runID: string) => {
     try {
-      const result = await workflowRuntimeApi.getRun(runID);
+      const { run } = await runHistoryApi.get(runID);
+      const result = workflowRunResponseFromRecord(run, workflow.id);
       const historyMessages: DebugChatMessage[] = [];
       if (result.run.input) {
         historyMessages.push({
@@ -389,7 +411,7 @@ export function WorkflowCanvasEditor({
           text: JSON.stringify(result.run.input, null, 2)
         });
       }
-      const trace = buildWorkflowTraceFromRun(result);
+      const trace = await loadTraceForRun(result);
       historyMessages.push({
         id: `workflow_history_assistant_${runID}`,
         role: "assistant",
@@ -399,6 +421,7 @@ export function WorkflowCanvasEditor({
       });
       setWorkflowTestMessages(historyMessages);
       setActiveWorkflowTrace(trace);
+      setWorkflowHistoryOpen(false);
     } catch (error) {
       setWorkflowTestMessages((current) => [
         ...current,
@@ -416,10 +439,10 @@ export function WorkflowCanvasEditor({
     setWorkflowRunning(true);
     setActiveWorkflowTrace(null);
     try {
-      const result = await workflowRuntimeApi.replayRun(runID, {
-        traceId: `workflow_replay_trace_${Date.now().toString(16)}`
-      });
-      appendWorkflowResult(result);
+      const { run } = await runHistoryApi.replay(runID);
+      const result = workflowRunResponseFromRecord(run, workflow.id);
+      appendWorkflowResult(result, await loadTraceForRun(result));
+      setWorkflowHistoryOpen(false);
       await loadWorkflowRunHistory();
     } catch (error) {
       setWorkflowTestMessages((current) => [
@@ -460,8 +483,10 @@ export function WorkflowCanvasEditor({
     setWorkflowRunning(true);
     setActiveWorkflowTrace(null);
     setWorkflowTestMessages((current) => [...current, userMessage]);
+    let workflowSpec: WorkflowSpec | undefined;
+    let traceId = "";
     try {
-      const workflowSpec = currentWorkflowSpec();
+      workflowSpec = currentWorkflowSpec();
       const issues = validateWorkflowCanvas(workflowSpec);
       setValidationIssues(issues);
       setValidationOpen(issues.length > 0);
@@ -476,24 +501,42 @@ export function WorkflowCanvasEditor({
         ]);
         return;
       }
-      const result = await workflowRuntimeApi.runWorkflow({
-        workflowId: workflowSpec.id,
-        workflow: workflowSpec,
-        input,
-        context: {},
-        traceId: `workflow_test_trace_${Date.now().toString(16)}`
+      await onSave(workflowSpec);
+      setWorkflowHistoryOpen(false);
+      if (!workspace.activeBundleId) {
+        throw new Error("No active config bundle selected.");
+      }
+      traceId = `workflow_test_trace_${Date.now().toString(16)}`;
+      const { session } = await debugSessionApi.createSession({
+        bundle_id: workspace.activeBundleId,
+        entrypoint: {
+          kind: "workflow",
+          id: workflowSpec.id
+        }
       });
-      appendWorkflowResult(result);
+      const runtimeResult = await debugSessionApi.runWorkflow(session.id, {
+        workflow_id: workflowSpec.id,
+        input,
+        trace_context: {
+          trace_id: traceId
+        }
+      });
+      const result = workflowRunResponseFromRuntime(workflowSpec.id, input, runtimeResult, traceId);
+      appendWorkflowResult(result, await loadTraceForRun(result));
       await loadWorkflowRunHistory();
     } catch (error) {
+      const trace = await workflowFailureTrace(traceId, workflowSpec, input, error);
       setWorkflowTestMessages((current) => [
         ...current,
         {
           id: `workflow_test_failed_${Date.now()}`,
           role: "assistant",
-          text: error instanceof Error ? error.message : "Workflow test failed."
+          text: `${error instanceof Error ? error.message : "Workflow test failed."}\n\nOpen trace to inspect the failed run.`,
+          traceId: trace?.traceId,
+          trace
         }
       ]);
+      if (trace) setActiveWorkflowTrace(trace);
     } finally {
       setWorkflowRunning(false);
     }
@@ -610,13 +653,20 @@ export function WorkflowCanvasEditor({
               </button>
             </section>
 
-            <WorkflowRunHistoryPanel
-              runs={workflowRunHistory}
-              activeRunId={activeWorkflowTrace?.eventId}
-              running={workflowRunning}
-              onOpenRun={(runID) => void openWorkflowHistoryRun(runID)}
-              onReplayRun={(runID) => void replayWorkflowHistoryRun(runID)}
-            />
+            <div className="workflow-run-history-menu">
+              <button className="secondary-action" type="button" onClick={() => setWorkflowHistoryOpen((current) => !current)}>
+                History ({workflowRunHistory.length})
+              </button>
+              {workflowHistoryOpen ? (
+                <WorkflowRunHistoryPanel
+                  runs={workflowRunHistory}
+                  activeRunId={activeWorkflowTrace?.eventId}
+                  running={workflowRunning}
+                  onOpenRun={(runID) => void openWorkflowHistoryRun(runID)}
+                  onReplayRun={(runID) => void replayWorkflowHistoryRun(runID)}
+                />
+              ) : null}
+            </div>
 
             <section className="flow-config-panel flow-test-chat-panel">
               <WorkflowTestMessages messages={workflowTestMessages} activeTrace={activeWorkflowTrace} onOpenTrace={setActiveWorkflowTrace} />
@@ -2457,6 +2507,108 @@ function sampleValueForType(type: string): unknown {
   return "";
 }
 
+function workflowRunFromRecord(run: RunRecord, fallbackWorkflowId: string): WorkflowRun {
+  const startedAt = run.started_at ?? new Date().toISOString();
+  return {
+    id: run.id,
+    tenantId: "tenant_1",
+    workflowId: runWorkflowId(run) || fallbackWorkflowId,
+    status: run.status === "failed" ? "failed" : "succeeded",
+    input: run.workflow_request?.input,
+    output: workflowOutputFromRunRecord(run),
+    error: run.error,
+    traceId: run.trace_id,
+    startedAt,
+    finishedAt: run.finished_at
+  };
+}
+
+function workflowRunResponseFromRecord(run: RunRecord, fallbackWorkflowId: string): WorkflowRunResponse {
+  return {
+    run: workflowRunFromRecord(run, fallbackWorkflowId),
+    nodeRuns: [],
+    error: run.error
+  };
+}
+
+function workflowRunResponseFromRuntime(
+  workflowId: string,
+  input: Record<string, unknown>,
+  result: RuntimeWorkflowRunResponse,
+  traceId: string
+): WorkflowRunResponse {
+  const now = new Date().toISOString();
+  return {
+    run: {
+      id: result.instance_id || `workflow_run_${Date.now().toString(16)}`,
+      tenantId: "tenant_1",
+      workflowId,
+      status: result.status === "failed" ? "failed" : result.status === "running" ? "running" : "succeeded",
+      input,
+      output: result.output,
+      traceId,
+      startedAt: now,
+      finishedAt: result.status === "running" ? undefined : now
+    },
+    nodeRuns: []
+  };
+}
+
+function runWorkflowId(run: RunRecord): string {
+  return run.workflow_request?.workflow_id ?? (run.entrypoint?.kind === "workflow" ? run.entrypoint.id : "");
+}
+
+function workflowOutputFromRunRecord(run: RunRecord): Record<string, unknown> | undefined {
+  const result = recordFromUnknown(run.result);
+  if (!result) return undefined;
+  const output = recordFromUnknown(result.output);
+  if (output) return output;
+  return result;
+}
+
+async function workflowFailureTrace(
+  traceId: string,
+  workflow: WorkflowSpec | undefined,
+  input: Record<string, unknown>,
+  error: unknown
+): Promise<AgentTrace | null> {
+  if (traceId) {
+    try {
+      return agentTraceFromTraceResponse(await runtimeApiV2.getTrace(traceId));
+    } catch {
+      // Fall through to a local fallback trace so the failed message remains inspectable.
+    }
+  }
+  if (!workflow) return null;
+  const now = new Date().toISOString();
+  const errorMessage = error instanceof Error ? error.message : "Workflow test failed.";
+  return {
+    traceId: traceId || `workflow_failed_trace_${Date.now().toString(16)}`,
+    tenantId: "tenant_1",
+    status: "failed",
+    startedAt: now,
+    finishedAt: now,
+    durationMillis: 0,
+    error: errorMessage,
+    steps: [
+      {
+        id: `workflow_failed_${workflow.id || Date.now().toString(16)}`,
+        type: "workflow",
+        name: workflow.name || workflow.id || "Workflow test",
+        status: "failed",
+        startedAt: now,
+        finishedAt: now,
+        durationMillis: 0,
+        error: errorMessage,
+        metadata: {
+          workflow_id: workflow.id,
+          request: input
+        }
+      }
+    ]
+  };
+}
+
 function buildWorkflowTraceFromRun(result: WorkflowRunResponse): AgentTrace {
   const rootStepId = `workflow_run_${result.run.id || result.run.traceId || Date.now().toString(16)}`;
   const steps: TraceStep[] = [
@@ -2590,11 +2742,8 @@ function workflowTraceStatusFromNodeRun(status: WorkflowNodeRun["status"]): Trac
 }
 
 function workflowNodeStepType(nodeType: WorkflowNodeType): TraceStep["type"] {
-  if (nodeType === "connector_operation") return "connector";
-  if (nodeType === "tool") return "tool";
-  if (nodeType === "skill") return "skill";
-  if (nodeType === "agent") return "agent";
-  return "event";
+  void nodeType;
+  return "node";
 }
 
 function durationMillis(startedAt?: string, finishedAt?: string): number | undefined {

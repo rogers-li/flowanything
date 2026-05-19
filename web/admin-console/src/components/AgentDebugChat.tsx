@@ -162,6 +162,21 @@ function runtimeProgressItem(event: RuntimeEvent, index: number): RuntimeProgres
       tone: "agent"
     };
   }
+  if (stepType === "model" && stepName) {
+    const isPlanning = stepName.toLowerCase().includes("planning") || stepName.toLowerCase().includes("plan");
+    return {
+      id: `model_${event.id ?? stepName}_${stepStatus}_${index}`,
+      title: `${stepStatus === "succeeded" ? "LLM 已完成" : stepStatus === "failed" ? "LLM 调用失败" : isPlanning ? "LLM 正在规划" : "LLM 正在生成"}：${stepName}`,
+      tone: stepStatus === "failed" ? "failed" : "running"
+    };
+  }
+  if (stepType === "tool" && stepName) {
+    return {
+      id: `tool_${event.id ?? stepName}_${stepStatus}_${index}`,
+      title: `${stepStatus === "succeeded" ? "Tool 已完成" : stepStatus === "failed" ? "Tool 调用失败" : "正在调用 Tool"}：${stepName}`,
+      tone: stepStatus === "failed" ? "failed" : stepStatus === "succeeded" ? "completed" : "running"
+    };
+  }
   if (stepType === "connector" && stepName) {
     return {
       id: `connector_${event.id ?? stepName}_${index}`,
@@ -376,6 +391,8 @@ function TraceStepDetail({
   const request = metadata.request;
   const response = metadata.response;
   const summary = traceMetadataSummary(metadata);
+  const metadataRest = metadataWithoutPayload(metadata);
+  const hasMetadata = Object.keys(metadataRest).length > 0;
 
   useEffect(() => {
     if (detailCollapseVersion > 0) {
@@ -412,7 +429,7 @@ function TraceStepDetail({
           {summary ? <p>{summary}</p> : null}
           {request !== undefined ? <JsonBlock title="Request" value={request} /> : null}
           {response !== undefined ? <JsonBlock title="Response" value={response} /> : null}
-          <JsonBlock title="Metadata" value={metadataWithoutPayload(metadata)} />
+          {hasMetadata ? <JsonBlock title="Metadata" value={metadataRest} /> : null}
         </div>
       ) : null}
     </article>
@@ -487,6 +504,13 @@ function metadataWithoutPayload(metadata: Record<string, unknown>): Record<strin
 }
 
 function traceStepTitle(step: TraceStep): string {
+  const kind = stringFromUnknown(step.metadata?.kind);
+  if (kind === "planning") return `ReAct · ${step.name || "Planning"} · ${step.status}`;
+  if (kind === "llm") return `LLM · ${step.name || "Model call"} · ${step.status}`;
+  if (step.type === "tool") return `Tool · ${step.name || "unnamed"} · ${step.status}`;
+  if (step.type === "connector") return `Connector API · ${step.name || "unnamed"} · ${step.status}`;
+  if (step.type === "node") return `Node · ${stringFromUnknown(step.metadata?.node_name) || step.name || "unnamed"} · ${step.status}`;
+  if (step.type === "agent") return `Agent · ${step.name || "unnamed"} · ${step.status}`;
   return `${step.type} · ${step.name || "unnamed"} · ${step.status}`;
 }
 
@@ -496,6 +520,7 @@ function traceStepBadge(step: TraceStep, index: number): string {
     event: "E",
     agent: "A",
     model: "M",
+    node: "N",
     skill: "S",
     tool: "T",
     workflow: "W"
@@ -518,9 +543,9 @@ function traceStepSummary(step: TraceStep): string {
 function traceMetadataSummary(metadata: Record<string, unknown>): string {
   const keys = [
     "scope",
-    "node_id",
-    "node_type",
     "node_name",
+    "node_type",
+    "node_id",
     "agent_id",
     "agent_name",
     "phase",

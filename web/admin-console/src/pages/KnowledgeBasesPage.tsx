@@ -2,7 +2,9 @@ import { useEffect, useMemo, useState } from "react";
 import { Badge } from "../components/Badge";
 import { DataTable } from "../components/DataTable";
 import { PageHeader } from "../components/PageHeader";
-import { defaultTenantId, knowledgeApi } from "../lib/api";
+import { useConfigWorkspace } from "../platform/ConfigWorkspaceProvider";
+import { resourceApi } from "../platform/configApi";
+import type { KnowledgeConfig } from "../platform/configTypes";
 import type { KnowledgeBase, KnowledgeDocument, KnowledgeSearchResult } from "../types/platform";
 
 const statusTone = {
@@ -38,6 +40,8 @@ function createDocumentDraft(): DocumentDraft {
 }
 
 export function KnowledgeBasesPage() {
+  const workspace = useConfigWorkspace();
+  const [knowledgeConfigs, setKnowledgeConfigs] = useState<KnowledgeConfig[]>([]);
   const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBase[]>([]);
   const [selectedBaseId, setSelectedBaseId] = useState("");
   const [documents, setDocuments] = useState<KnowledgeDocument[]>([]);
@@ -55,7 +59,7 @@ export function KnowledgeBasesPage() {
 
   useEffect(() => {
     void loadKnowledgeBases();
-  }, []);
+  }, [workspace.activeBundleId]);
 
   useEffect(() => {
     if (!notice) return;
@@ -74,9 +78,18 @@ export function KnowledgeBasesPage() {
   const loadKnowledgeBases = async () => {
     setLoading(true);
     try {
-      const resp = await knowledgeApi.listKnowledgeBases();
-      setKnowledgeBases(resp.items);
-      setSelectedBaseId((current) => current || resp.items[0]?.id || "");
+      if (!workspace.activeBundleId) {
+        setKnowledgeConfigs([]);
+        setKnowledgeBases([]);
+        setSelectedBaseId("");
+        return;
+      }
+      const resp = await resourceApi.listResourcesByKind<KnowledgeConfig>(workspace.activeBundleId, "knowledge");
+      const configs = resp.items.map((item) => item.resource);
+      const bases = configs.map(knowledgeBaseFromConfig);
+      setKnowledgeConfigs(configs);
+      setKnowledgeBases(bases);
+      setSelectedBaseId((current) => current || bases[0]?.id || "");
     } catch (error) {
       setNotice({ ok: false, message: error instanceof Error ? error.message : "Failed to load knowledge bases." });
     } finally {
@@ -85,12 +98,8 @@ export function KnowledgeBasesPage() {
   };
 
   const loadDocuments = async (kbId: string) => {
-    try {
-      const resp = await knowledgeApi.listDocuments(kbId);
-      setDocuments(resp.items);
-    } catch (error) {
-      setNotice({ ok: false, message: error instanceof Error ? error.message : "Failed to load documents." });
-    }
+    const config = knowledgeConfigs.find((item) => item.id === kbId);
+    setDocuments(config ? documentsFromKnowledgeConfig(config) : []);
   };
 
   const createKnowledgeBase = async () => {
@@ -99,18 +108,9 @@ export function KnowledgeBasesPage() {
       return;
     }
     try {
-      const saved = await knowledgeApi.createKnowledgeBase({
-        id: "",
-        tenantId: defaultTenantId,
-        name: knowledgeDraft.name.trim(),
-        description: knowledgeDraft.description.trim(),
-        status: "draft",
-        embeddingModel: knowledgeDraft.embeddingModel.trim(),
-        documentCount: 0,
-        chunkCount: 0,
-        version: "v1",
-        updatedAt: ""
-      });
+      if (!workspace.activeBundleId) throw new Error("No active config bundle selected.");
+      const saved = knowledgeConfigFromDraft(knowledgeDraft);
+      await resourceApi.upsertResource(workspace.activeBundleId, "knowledge", saved);
       setKnowledgeDraft(createKnowledgeDraft());
       setSelectedBaseId(saved.id);
       await loadKnowledgeBases();
@@ -123,8 +123,21 @@ export function KnowledgeBasesPage() {
   const changeKnowledgeBaseStatus = async (status: "enabled" | "disabled") => {
     if (!selectedBase) return;
     try {
-      const saved = await knowledgeApi.setKnowledgeBaseStatus(selectedBase.id, status);
-      setKnowledgeBases((current) => current.map((item) => (item.id === saved.id ? saved : item)));
+      if (!workspace.activeBundleId) throw new Error("No active config bundle selected.");
+      const current = knowledgeConfigs.find((item) => item.id === selectedBase.id);
+      if (!current) throw new Error("Knowledge base not found in active config bundle.");
+      const saved: KnowledgeConfig = {
+        ...current,
+        disabled: status !== "enabled",
+        metadata: {
+          ...(current.metadata ?? {}),
+          status,
+          updated_at: new Date().toISOString()
+        }
+      };
+      await resourceApi.upsertResource(workspace.activeBundleId, "knowledge", saved);
+      setKnowledgeConfigs((items) => items.map((item) => (item.id === saved.id ? saved : item)));
+      setKnowledgeBases((items) => items.map((item) => (item.id === saved.id ? knowledgeBaseFromConfig(saved) : item)));
       setNotice({ ok: true, message: `Knowledge base ${status}.` });
     } catch (error) {
       setNotice({ ok: false, message: error instanceof Error ? error.message : "Failed to change status." });
@@ -141,16 +154,29 @@ export function KnowledgeBasesPage() {
       return;
     }
     try {
-      await knowledgeApi.indexDocument({
-        id: "",
-        tenantId: defaultTenantId,
-        kbId: selectedBase.id,
-        title: documentDraft.title.trim(),
-        text: documentDraft.text,
-        version: "v1"
-      });
+      if (!workspace.activeBundleId) throw new Error("No active config bundle selected.");
+      const current = knowledgeConfigs.find((item) => item.id === selectedBase.id);
+      if (!current) throw new Error("Knowledge base not found in active config bundle.");
+      const nextDocuments = [
+        ...documentsFromKnowledgeConfig(current),
+        {
+          id: stableResourceId("doc", documentDraft.title),
+          tenantId: "tenant_1",
+          kbId: selectedBase.id,
+          title: documentDraft.title.trim(),
+          text: documentDraft.text,
+          version: "v1",
+          metadata: {
+            title: documentDraft.title.trim()
+          }
+        }
+      ];
+      const saved = knowledgeConfigWithDocuments(current, nextDocuments);
+      await resourceApi.upsertResource(workspace.activeBundleId, "knowledge", saved);
+      setKnowledgeConfigs((items) => items.map((item) => (item.id === saved.id ? saved : item)));
+      setKnowledgeBases((items) => items.map((item) => (item.id === saved.id ? knowledgeBaseFromConfig(saved) : item)));
       setDocumentDraft(createDocumentDraft());
-      await Promise.all([loadKnowledgeBases(), loadDocuments(selectedBase.id)]);
+      setDocuments(nextDocuments);
       setNotice({ ok: true, message: "Document indexed." });
     } catch (error) {
       setNotice({ ok: false, message: error instanceof Error ? error.message : "Failed to index document." });
@@ -164,8 +190,7 @@ export function KnowledgeBasesPage() {
       return;
     }
     try {
-      const result = await knowledgeApi.search({ kbIds: [selectedBase.id], text: searchText.trim(), topK: 5 });
-      setSearchResult(result);
+      setSearchResult(localKnowledgeSearch(selectedBase.id, documents, searchText.trim()));
     } catch (error) {
       setNotice({ ok: false, message: error instanceof Error ? error.message : "Search failed." });
     }
@@ -368,4 +393,132 @@ function formatDate(value: string): string {
     hour: "2-digit",
     minute: "2-digit"
   }).format(new Date(timestamp));
+}
+
+function knowledgeConfigFromDraft(draft: KnowledgeDraft): KnowledgeConfig {
+  const id = stableResourceId("kb", draft.name);
+  const now = new Date().toISOString();
+  return {
+    id,
+    name: draft.name.trim(),
+    description: draft.description.trim(),
+    version: "v1",
+    disabled: true,
+    metadata: {
+      status: "draft",
+      updated_at: now
+    },
+    type: "manual",
+    source: {
+      kind: "manual",
+      config: {
+        documents: []
+      }
+    },
+    embedding_model_ref: {
+      kind: "model",
+      id: draft.embeddingModel.trim() || "lexical-memory"
+    },
+    runtime: {
+      server_proxy_allowed: true
+    }
+  };
+}
+
+function knowledgeBaseFromConfig(config: KnowledgeConfig): KnowledgeBase {
+  const documents = documentsFromKnowledgeConfig(config);
+  return {
+    id: config.id,
+    tenantId: "tenant_1",
+    name: config.name,
+    description: config.description,
+    status: knowledgeStatus(config),
+    embeddingModel: config.embedding_model_ref?.id,
+    documentCount: documents.length,
+    chunkCount: documents.length,
+    metadata: config.metadata,
+    version: config.version ?? "v1",
+    updatedAt: typeof config.metadata?.updated_at === "string" ? config.metadata.updated_at : ""
+  };
+}
+
+function knowledgeConfigWithDocuments(config: KnowledgeConfig, documents: KnowledgeDocument[]): KnowledgeConfig {
+  return {
+    ...config,
+    metadata: {
+      ...(config.metadata ?? {}),
+      updated_at: new Date().toISOString()
+    },
+    source: {
+      kind: config.source?.kind ?? "manual",
+      uri: config.source?.uri,
+      config: {
+        ...(config.source?.config ?? {}),
+        documents
+      }
+    }
+  };
+}
+
+function documentsFromKnowledgeConfig(config: KnowledgeConfig): KnowledgeDocument[] {
+  const documents = config.source?.config?.documents;
+  if (!Array.isArray(documents)) return [];
+  return documents
+    .map((item) => (item && typeof item === "object" && !Array.isArray(item) ? (item as Partial<KnowledgeDocument>) : null))
+    .filter((item): item is Partial<KnowledgeDocument> => Boolean(item))
+    .map((item) => ({
+      id: typeof item.id === "string" ? item.id : stableResourceId("doc", item.title ?? config.name),
+      tenantId: "tenant_1",
+      kbId: config.id,
+      title: typeof item.title === "string" ? item.title : "Untitled document",
+      text: typeof item.text === "string" ? item.text : "",
+      metadata: item.metadata,
+      version: typeof item.version === "string" ? item.version : "v1"
+    }));
+}
+
+function localKnowledgeSearch(kbId: string, documents: KnowledgeDocument[], query: string): KnowledgeSearchResult {
+  const terms = query
+    .toLowerCase()
+    .split(/\s+/)
+    .map((term) => term.trim())
+    .filter(Boolean);
+  const chunks = documents
+    .map((document) => {
+      const haystack = `${document.title}\n${document.text}`.toLowerCase();
+      const hits = terms.reduce((count, term) => count + (haystack.includes(term) ? 1 : 0), 0);
+      return {
+        id: `${document.id}_preview`,
+        docId: document.id,
+        kbId,
+        text: document.text.slice(0, 800),
+        score: terms.length === 0 ? 0 : hits / terms.length,
+        metadata: {
+          ...(document.metadata ?? {}),
+          title: document.title
+        }
+      };
+    })
+    .filter((chunk) => chunk.score > 0)
+    .sort((left, right) => right.score - left.score)
+    .slice(0, 5);
+  return {
+    queryId: stableResourceId("query", query),
+    chunks
+  };
+}
+
+function knowledgeStatus(config: KnowledgeConfig): KnowledgeBase["status"] {
+  const status = config.metadata?.status;
+  if (status === "draft" || status === "enabled" || status === "disabled") return status;
+  return config.disabled ? "disabled" : "enabled";
+}
+
+function stableResourceId(prefix: string, name: string): string {
+  const normalized = name
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return `${prefix}_${normalized || Date.now().toString(16)}`;
 }

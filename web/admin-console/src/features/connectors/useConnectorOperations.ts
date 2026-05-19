@@ -1,11 +1,18 @@
 import { useEffect, useMemo, useState } from "react";
-import { defaultTenantId } from "../../lib/api";
-import { connectorDependencies, connectorOperations, connectors as mockConnectors } from "../../lib/mockData";
+import type { AgentConfig, ConnectorConfig, ConnectorOperationConfig, SkillConfig, ToolConfig } from "../../platform/configTypes";
+import { resourceApi, runtimeApiV2 } from "../../platform/configApi";
+import { useConfigWorkspace } from "../../platform/ConfigWorkspaceProvider";
 import type { Connector, ConnectorDependencies, ConnectorInvokeResult, ConnectorOperation } from "../../types/platform";
 import { useAutoDismissNotice, type NoticeState } from "../common/useAutoDismissNotice";
-import { connectorOperationsClient } from "./api";
 import {
-  connectorFromDraft,
+  connectorConfigFromDraft,
+  connectorFromConfig,
+  connectorInvokeResultFromRuntime,
+  connectorOperationConfigFromDraft,
+  connectorOperationFromConfig,
+  dependenciesForConnectorOperation
+} from "./configModel";
+import {
   createConnectorConfigDraft,
   createConnectorDraft,
   draftFromConnector,
@@ -19,18 +26,15 @@ import {
 type SaveResult = NoticeState;
 
 export function useConnectorOperations() {
-  const [connectors, setConnectors] = useState<Connector[]>(mockConnectors);
-  const [selectedConnectorId, setSelectedConnectorId] = useState(mockConnectors[0]?.id ?? "");
-  const [connectorDraft, setConnectorDraft] = useState<ConnectorDraft>(() =>
-    mockConnectors[0] ? draftFromConnector(mockConnectors[0]) : createConnectorConfigDraft()
-  );
-  const [operations, setOperations] = useState<ConnectorOperation[]>(connectorOperations);
-  const [selectedOperationId, setSelectedOperationId] = useState(connectorOperations[0]?.id ?? "");
-  const [draft, setDraft] = useState<ConnectorOperationDraft>(() =>
-    connectorOperations[0] ? draftFromOperation(connectorOperations[0]) : createConnectorDraft()
-  );
-  const [dependenciesByOperation, setDependenciesByOperation] =
-    useState<Record<string, ConnectorDependencies>>(connectorDependencies);
+  const workspace = useConfigWorkspace();
+  const [connectors, setConnectors] = useState<Connector[]>([]);
+  const [connectorConfigs, setConnectorConfigs] = useState<ConnectorConfig[]>([]);
+  const [selectedConnectorId, setSelectedConnectorId] = useState("");
+  const [connectorDraft, setConnectorDraft] = useState<ConnectorDraft>(() => createConnectorConfigDraft());
+  const [operations, setOperations] = useState<ConnectorOperation[]>([]);
+  const [selectedOperationId, setSelectedOperationId] = useState("");
+  const [draft, setDraft] = useState<ConnectorOperationDraft>(() => createConnectorDraft());
+  const [dependenciesByOperation, setDependenciesByOperation] = useState<Record<string, ConnectorDependencies>>({});
   const [testArgsJson, setTestArgsJson] = useState('{\n  "order_id": "o_123"\n}');
   const [testResult, setTestResult] = useState<ConnectorInvokeResult | null>(null);
   const [notice, setNotice] = useAutoDismissNotice<SaveResult>();
@@ -49,7 +53,7 @@ export function useConnectorOperations() {
 
   useEffect(() => {
     void refreshRegistry();
-  }, []);
+  }, [workspace.activeBundleId]);
 
   useEffect(() => {
     if (selectedConnector) {
@@ -70,24 +74,46 @@ export function useConnectorOperations() {
   }, [selectedOperation?.id]);
 
   async function refreshRegistry() {
+    if (!workspace.activeBundleId) {
+      setConnectors([]);
+      setConnectorConfigs([]);
+      setOperations([]);
+      return;
+    }
     try {
-      const [remoteConnectors, remoteOperations] = await Promise.all([
-        connectorOperationsClient.listConnectors(),
-        connectorOperationsClient.listOperations()
-      ]);
-      setConnectors(remoteConnectors);
-      setOperations(remoteOperations);
-      setSelectedConnectorId((current) => current || remoteConnectors[0]?.id || "");
-      setSelectedOperationId((current) => current || remoteOperations[0]?.id || "");
-    } catch {
-      setNotice({ ok: false, message: "Using local connector mock data because Platform API is unavailable." });
+      const response = await resourceApi.listResourcesByKind<ConnectorConfig>(workspace.activeBundleId, "connector");
+      const configs = response.items.map((item) => item.resource);
+      const nextConnectors = configs.map(connectorFromConfig);
+      const nextOperations = configs.flatMap((connector) =>
+        (connector.operations ?? []).map((operation) => connectorOperationFromConfig(connector, operation))
+      );
+      setConnectorConfigs(configs);
+      setConnectors(nextConnectors);
+      setOperations(nextOperations);
+      setSelectedConnectorId((current) => current || nextConnectors[0]?.id || "");
+      setSelectedOperationId((current) => current || nextOperations[0]?.id || "");
+    } catch (error) {
+      setNotice({ ok: false, message: error instanceof Error ? error.message : "Failed to load connectors." });
     }
   }
 
   async function loadDependencies(operationId: string) {
+    if (!workspace.activeBundleId) return;
     try {
-      const dependencies = await connectorOperationsClient.getDependencies(operationId);
-      setDependenciesByOperation((current) => ({ ...current, [operationId]: dependencies }));
+      const [tools, skills, agents] = await Promise.all([
+        resourceApi.listResourcesByKind<ToolConfig>(workspace.activeBundleId, "tool"),
+        resourceApi.listResourcesByKind<SkillConfig>(workspace.activeBundleId, "skill"),
+        resourceApi.listResourcesByKind<AgentConfig>(workspace.activeBundleId, "agent")
+      ]);
+      setDependenciesByOperation((current) => ({
+        ...current,
+        [operationId]: dependenciesForConnectorOperation(
+          operationId,
+          tools.items.map((item) => item.resource),
+          skills.items.map((item) => item.resource),
+          agents.items.map((item) => item.resource)
+        )
+      }));
     } catch {
       setDependenciesByOperation((current) => ({
         ...current,
@@ -97,10 +123,19 @@ export function useConnectorOperations() {
   }
 
   async function saveConnectorDraft() {
+    if (!workspace.activeBundleId) {
+      setNotice({ ok: false, message: "No active config bundle selected." });
+      return;
+    }
     try {
-      const connector = connectorFromDraft(connectorDraft, defaultTenantId);
-      const saved = await connectorOperationsClient.saveConnector(connector);
+      const connectorId = connectorDraft.id || stableResourceId("conn", connectorDraft.name);
+      const current = connectorConfigs.find((item) => item.id === connectorId);
+      const operationConfigs = current?.operations ?? [];
+      const connector = connectorConfigFromDraft({ ...connectorDraft, id: connectorId }, operationConfigs, current);
+      await resourceApi.upsertResource(workspace.activeBundleId, "connector", connector);
+      const saved = connectorFromConfig(connector);
       upsertConnector(saved);
+      setConnectorConfigs((current) => upsertConfig(current, connector));
       setSelectedConnectorId(saved.id);
       setConnectorDraft(draftFromConnector(saved));
       setNotice({ ok: true, message: "Connector saved." });
@@ -110,13 +145,38 @@ export function useConnectorOperations() {
   }
 
   async function saveDraft() {
+    if (!workspace.activeBundleId) {
+      setNotice({ ok: false, message: "No active config bundle selected." });
+      return;
+    }
     try {
-      const operation = operationFromDraft(draft, defaultTenantId);
-      const saved = await connectorOperationsClient.saveOperation(operation);
-      const savedWithMetadata = preserveCapabilityMetadata(saved, operation);
-      upsertOperation(savedWithMetadata);
-      setSelectedOperationId(savedWithMetadata.id);
-      setDraft(draftFromOperation(savedWithMetadata));
+      const operation = operationFromDraft(draft, "tenant_1");
+      const connectorId = operation.connectorId || selectedConnectorId;
+      if (!connectorId) {
+        throw new Error("Save the connector before adding operations.");
+      }
+      const connector = connectorConfigs.find((item) => item.id === connectorId);
+      const connectorView = connectors.find((item) => item.id === connectorId);
+      if (!connector || !connectorView) {
+        throw new Error("Connector not found in active config bundle.");
+      }
+      const currentOperation = connector.operations?.find((item) => item.id === operation.id);
+      const operationConfig = connectorOperationConfigFromDraft({ ...draft, id: operation.id, connectorId }, currentOperation);
+      await resourceApi.upsertConnectorOperation(workspace.activeBundleId, connectorId, operationConfig);
+      const savedOperation = connectorOperationFromConfig(connector, operationConfig);
+      upsertOperation(savedOperation);
+      setConnectorConfigs((current) =>
+        current.map((item) =>
+          item.id === connectorId
+            ? {
+                ...item,
+                operations: upsertConfig(item.operations ?? [], operationConfig)
+              }
+            : item
+        )
+      );
+      setSelectedOperationId(savedOperation.id);
+      setDraft(draftFromOperation(savedOperation));
       setNotice({ ok: true, message: "Connector operation saved." });
     } catch (error) {
       setNotice({ ok: false, message: error instanceof Error ? error.message : "Failed to save operation." });
@@ -144,12 +204,23 @@ export function useConnectorOperations() {
   }
 
   async function changeConnectorStatus(connectorId: string, status: Connector["status"]) {
+    if (!workspace.activeBundleId) return;
     try {
-      const saved =
-        status === "enabled"
-          ? await connectorOperationsClient.enableConnector(connectorId)
-          : await connectorOperationsClient.disableConnector(connectorId);
+      const current = connectorConfigs.find((connector) => connector.id === connectorId);
+      if (!current) throw new Error("Connector not found in active config bundle.");
+      const currentView = connectors.find((connector) => connector.id === connectorId);
+      const config = connectorConfigFromDraft(
+        {
+          ...(currentView ? draftFromConnector(currentView) : createConnectorConfigDraft()),
+          status
+        },
+        current.operations ?? [],
+        current
+      );
+      await resourceApi.upsertResource(workspace.activeBundleId, "connector", config);
+      const saved = connectorFromConfig(config);
       upsertConnector(saved);
+      setConnectorConfigs((items) => upsertConfig(items, config));
       setConnectorDraft(draftFromConnector(saved));
       setNotice({ ok: true, message: `Connector ${status}.` });
     } catch (error) {
@@ -158,15 +229,31 @@ export function useConnectorOperations() {
   }
 
   async function changeStatus(operationId: string, status: ConnectorOperation["status"]) {
+    if (!workspace.activeBundleId) return;
     try {
-      const saved =
-        status === "enabled"
-          ? await connectorOperationsClient.enableOperation(operationId)
-          : await connectorOperationsClient.disableOperation(operationId);
       const current = operations.find((operation) => operation.id === operationId);
-      const savedWithMetadata = current ? preserveCapabilityMetadata(saved, current) : saved;
-      upsertOperation(savedWithMetadata);
-      setDraft(draftFromOperation(savedWithMetadata));
+      if (!current?.connectorId) throw new Error("Connector operation is not bound to a connector.");
+      const connector = connectorConfigs.find((item) => item.id === current.connectorId);
+      if (!connector) throw new Error("Connector not found in active config bundle.");
+      const currentOperationConfig = connector.operations?.find((operation) => operation.id === operationId);
+      const operationConfig = connectorOperationConfigFromDraft({
+        ...draftFromOperation(current),
+        status
+      }, currentOperationConfig);
+      await resourceApi.upsertConnectorOperation(workspace.activeBundleId, current.connectorId, operationConfig);
+      const saved = connectorOperationFromConfig(connector, operationConfig);
+      upsertOperation(saved);
+      setConnectorConfigs((items) =>
+        items.map((item) =>
+          item.id === current.connectorId
+            ? {
+                ...item,
+                operations: upsertConfig(item.operations ?? [], operationConfig)
+              }
+            : item
+        )
+      );
+      setDraft(draftFromOperation(saved));
       setNotice({ ok: true, message: `Connector operation ${status}.` });
     } catch (error) {
       setNotice({ ok: false, message: error instanceof Error ? error.message : `Failed to mark operation ${status}.` });
@@ -177,9 +264,10 @@ export function useConnectorOperations() {
     if (!selectedOperation) return;
     try {
       const args = JSON.parse(testArgsJson || "{}") as Record<string, unknown>;
-      const result = await connectorOperationsClient.testOperation(selectedOperation.id, args);
-      setTestResult(result);
-      setNotice({ ok: result.success, message: result.success ? "Test invocation succeeded." : "Test invocation failed." });
+      const result = await runtimeApiV2.invokeConnector({ operation_id: selectedOperation.id, input: args });
+      const normalized = connectorInvokeResultFromRuntime(selectedOperation.id, result);
+      setTestResult(normalized);
+      setNotice({ ok: normalized.success, message: normalized.success ? "Test invocation succeeded." : "Test invocation failed." });
     } catch (error) {
       setTestResult(null);
       setNotice({ ok: false, message: error instanceof Error ? error.message : "Failed to test operation." });
@@ -223,23 +311,11 @@ export function useConnectorOperations() {
   }
 
   function upsertConnector(connector: Connector) {
-    setConnectors((current) => {
-      const exists = current.some((item) => item.id === connector.id);
-      if (exists) {
-        return current.map((item) => (item.id === connector.id ? connector : item));
-      }
-      return [connector, ...current];
-    });
+    setConnectors((current) => upsertById(current, connector));
   }
 
   function upsertOperation(operation: ConnectorOperation) {
-    setOperations((current) => {
-      const exists = current.some((item) => item.id === operation.id);
-      if (exists) {
-        return current.map((item) => (item.id === operation.id ? preserveCapabilityMetadata(operation, item) : item));
-      }
-      return [operation, ...current];
-    });
+    setOperations((current) => upsertById(current, operation));
   }
 
   return {
@@ -273,12 +349,21 @@ export function useConnectorOperations() {
   };
 }
 
-function preserveCapabilityMetadata(operation: ConnectorOperation, fallback: ConnectorOperation): ConnectorOperation {
-  return {
-    ...operation,
-    connectorId: operation.connectorId ?? fallback.connectorId,
-    businessDomain: operation.businessDomain ?? fallback.businessDomain,
-    ownerTeam: operation.ownerTeam ?? fallback.ownerTeam,
-    implementationMode: operation.implementationMode ?? fallback.implementationMode
-  };
+function upsertById<TItem extends { id: string }>(items: TItem[], item: TItem): TItem[] {
+  return items.some((current) => current.id === item.id)
+    ? items.map((current) => (current.id === item.id ? item : current))
+    : [item, ...items];
+}
+
+function upsertConfig<TItem extends { id: string }>(items: TItem[], item: TItem): TItem[] {
+  return upsertById(items, item);
+}
+
+function stableResourceId(prefix: string, name: string): string {
+  const normalized = name
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return `${prefix}_${normalized || Date.now().toString(16)}`;
 }

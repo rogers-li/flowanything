@@ -30,6 +30,7 @@ export type ConnectorDraft = {
   timeoutMillis: number;
   authType: NonNullable<Connector["auth"]>["type"];
   secretRef: string;
+  authConfig: Record<string, unknown>;
   headers: HeaderDraft[];
 };
 
@@ -80,6 +81,7 @@ export function createConnectorConfigDraft(): ConnectorDraft {
     timeoutMillis: 10000,
     authType: "none",
     secretRef: "",
+    authConfig: {},
     headers: []
   };
 }
@@ -97,6 +99,7 @@ export function draftFromConnector(connector: Connector): ConnectorDraft {
     timeoutMillis: connector.timeoutMillis,
     authType: connector.auth?.type ?? "none",
     secretRef: connector.auth?.secretRef ?? "",
+    authConfig: connector.auth?.config ?? {},
     headers: headersFromRecord(connector.headers ?? {})
   };
 }
@@ -116,7 +119,8 @@ export function connectorFromDraft(draft: ConnectorDraft, tenantId: string): Con
     headers: headersToRecord(draft.headers),
     auth: {
       type: draft.authType,
-      secretRef: secretRef || undefined
+      secretRef: secretRef || undefined,
+      config: draft.authConfig
     },
     timeoutMillis: draft.timeoutMillis
   };

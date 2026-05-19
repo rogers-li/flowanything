@@ -113,9 +113,17 @@ function ToolSelectorRow({
   onChange: (checked: boolean) => void;
   tool: ToolSpec;
 }) {
+  const selected = checked || inherited;
+  const inheritedOnly = inherited && !checked;
   return (
-    <label className={checked ? "agent-tool-row agent-tool-row-active" : "agent-tool-row"}>
-      <input checked={checked} type="checkbox" onChange={(event) => onChange(event.target.checked)} />
+    <label className={selected ? "agent-tool-row agent-tool-row-active" : "agent-tool-row"}>
+      <input
+        checked={selected}
+        disabled={inheritedOnly}
+        title={inheritedOnly ? "This tool is selected through a bound Skill. Remove the Skill to unselect it." : undefined}
+        type="checkbox"
+        onChange={(event) => onChange(event.target.checked)}
+      />
       <span>
         <strong>{tool.name}</strong>
         <small>{tool.description}</small>

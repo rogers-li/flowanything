@@ -1590,6 +1590,33 @@ tbody tr:last-child td {
   line-height: 1.4;
 }
 
+.connector-auth-ref-list {
+  display: grid;
+  gap: 0.36rem;
+  margin: 0;
+}
+
+.connector-auth-ref-list div {
+  display: grid;
+  grid-template-columns: 6.5rem minmax(0, 1fr);
+  gap: 0.5rem;
+  align-items: start;
+}
+
+.connector-auth-ref-list dt {
+  color: var(--color-muted);
+  font-size: 0.76rem;
+  font-weight: 800;
+}
+
+.connector-auth-ref-list dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: var(--color-text);
+  font-size: 0.78rem;
+  font-weight: 800;
+}
+
 .connector-detail-toolbar {
   display: flex;
   align-items: center;
@@ -4613,6 +4640,15 @@ tbody tr:last-child td {
   --trace-node-bg: linear-gradient(90deg, rgba(15, 118, 110, 0.08), #fff 42%);
 }
 
+.trace-step-node .trace-step-detail-summary > span {
+  background: #2563eb;
+}
+
+.trace-step-node {
+  --trace-node-color: rgba(37, 99, 235, 0.46);
+  --trace-node-bg: linear-gradient(90deg, rgba(37, 99, 235, 0.07), #fff 42%);
+}
+
 .trace-step-connector .trace-step-detail-summary > span {
   background: #7b4ac9;
 }
@@ -6153,6 +6189,28 @@ tbody tr:last-child td {
   gap: 0.65rem;
   border-bottom: 1px solid var(--color-border);
   padding: 0.8rem 1rem;
+}
+
+.workflow-run-history-menu {
+  position: relative;
+  display: flex;
+  justify-content: flex-end;
+  border-bottom: 1px solid var(--color-border);
+  padding: 0.55rem 1rem;
+}
+
+.workflow-run-history-menu .workflow-run-history-panel {
+  position: absolute;
+  top: calc(100% + 0.35rem);
+  right: 1rem;
+  z-index: 12;
+  width: min(28rem, calc(100% - 2rem));
+  max-height: 22rem;
+  overflow: auto;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  background: #fff;
+  box-shadow: 0 20px 50px rgba(20, 31, 56, 0.16);
 }
 
 .workflow-run-history-heading p {

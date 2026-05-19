@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"flow-anything/core/flowengine"
+	"flow-anything/core/runtimecontext"
 )
 
 type fakeConnectorInvoker struct {
@@ -39,6 +40,47 @@ func (f *fakeAgentRunner) RunAgent(_ context.Context, req AgentRunRequest) (Agen
 		Output:      map[string]any{"answer": "agent:" + req.Message},
 		NextNodeIDs: []string{"end"},
 	}, nil
+}
+
+type directedAgentRunner struct {
+	calls []AgentRunRequest
+}
+
+func (f *directedAgentRunner) RunAgent(_ context.Context, req AgentRunRequest) (AgentRunResult, error) {
+	f.calls = append(f.calls, req)
+	return AgentRunResult{
+		Text:   `{"text":"route to search","next_node_ids":["search","unknown"]}`,
+		Output: map[string]any{"text": "route to search", "next_node_ids": []any{"search", "unknown"}},
+	}, nil
+}
+
+func TestConnectorNodeOutputUsesHTTPBodyAsMappingRoot(t *testing.T) {
+	output := connectorNodeOutput(ConnectorInvokeResult{
+		Output: map[string]any{
+			"success":     true,
+			"status_code": 200,
+			"body": map[string]any{
+				"data": map[string]any{
+					"document": map[string]any{
+						"document_id": "doc_123",
+					},
+				},
+			},
+			"headers": map[string]any{"x-request-id": "req_1"},
+		},
+		Raw: `{"data":{"document":{"document_id":"doc_123"}}}`,
+	})
+	data, ok := output["data"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected API body data at output root, got %#v", output)
+	}
+	document := data["document"].(map[string]any)
+	if document["document_id"] != "doc_123" {
+		t.Fatalf("unexpected document id: %#v", document["document_id"])
+	}
+	if _, ok := output["_connector"].(map[string]any); !ok {
+		t.Fatalf("expected connector envelope metadata, got %#v", output)
+	}
 }
 
 func TestWorkflowNodesRunConnectorToolAndAgent(t *testing.T) {
@@ -153,11 +195,20 @@ func TestWorkflowNodesRunConnectorToolAndAgent(t *testing.T) {
 	if len(connectors.calls) != 1 || connectors.calls[0].OperationID != "weather_query" {
 		t.Fatalf("unexpected connector calls: %#v", connectors.calls)
 	}
+	if connectors.calls[0].TraceContext.SpanID != "" || connectors.calls[0].TraceContext.ParentSpanID != runtimecontext.NodeSpanID("instance_nodes", "connector") {
+		t.Fatalf("connector call should create a child span under the workflow node, got %#v", connectors.calls[0].TraceContext)
+	}
 	if len(tools.calls) != 1 || tools.calls[0].ToolID != "summarize_weather" {
 		t.Fatalf("unexpected tool calls: %#v", tools.calls)
 	}
+	if tools.calls[0].TraceContext.SpanID != "" || tools.calls[0].TraceContext.ParentSpanID != runtimecontext.NodeSpanID("instance_nodes", "tool") {
+		t.Fatalf("tool call should create a child span under the workflow node, got %#v", tools.calls[0].TraceContext)
+	}
 	if len(agents.calls) != 1 || agents.calls[0].Agent.ID != "agent_weather" {
 		t.Fatalf("unexpected agent calls: %#v", agents.calls)
+	}
+	if agents.calls[0].TraceContext.SpanID != "" || agents.calls[0].TraceContext.ParentSpanID != runtimecontext.NodeSpanID("instance_nodes", "agent") {
+		t.Fatalf("agent call should create a child span under the workflow node, got %#v", agents.calls[0].TraceContext)
 	}
 	if _, ok := instance.NodeStates["skipped"]; ok {
 		t.Fatalf("agent dynamic next node should skip static branch")
@@ -167,6 +218,71 @@ func TestWorkflowNodesRunConnectorToolAndAgent(t *testing.T) {
 	}
 	if got, ok := instance.Context.Read("$.node_context.connector.responses.weather_query.output.status"); !ok || got != "ok" {
 		t.Fatalf("connector node context not written: %#v ok=%v", got, ok)
+	}
+}
+
+func TestAgentNodeDirectedRoutingUsesStructuredNextNodeIDs(t *testing.T) {
+	agents := &directedAgentRunner{}
+	registry, err := NewDefaultWorkflowRegistry(NodeRuntime{
+		Agents:     agents,
+		Transforms: NewDefaultTransformRegistry(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := NewRuntime(flowengine.NewStatefulExecutor(registry, flowengine.NewMemoryInstanceStore(), flowengine.WithInstanceIDFunc(func() string { return "instance_directed" })))
+	document := WorkflowDocument{
+		ID: "doc_directed",
+		Spec: flowengine.FlowSpec{
+			ID: "flow_directed",
+			Nodes: []flowengine.NodeSpec{
+				{ID: "start", Type: flowengine.NodeTypeStart},
+				{
+					ID:   "router",
+					Type: NodeTypeAgent,
+					Config: map[string]any{
+						"agent": map[string]any{
+							"id":             "agent_router",
+							"name":           "Router",
+							"reasoning_mode": "direct",
+						},
+						"message_field": "message",
+						"metadata": map[string]any{
+							"agent_routing_mode": "agent_directed",
+						},
+					},
+					InputMappings: []flowengine.FieldBinding{{
+						Field:   "message",
+						Enabled: true,
+						Source:  flowengine.ValueSource{Type: flowengine.SourceContext, Path: "$.flow_input.user_request"},
+					}},
+				},
+				{ID: "search", Type: flowengine.NodeTypeNoop},
+				{ID: "news", Type: flowengine.NodeTypeNoop},
+			},
+			Edges: []flowengine.EdgeSpec{
+				{From: "start", To: "router"},
+				{From: "router", To: "search"},
+				{From: "router", To: "news"},
+			},
+		},
+	}
+	compiled, _, err := NewCompiler(registry).Compile(context.Background(), document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance, err := runtime.Start(context.Background(), compiled, map[string]any{"user_request": "AI news"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := instance.NodeStates["search"]; !ok {
+		t.Fatalf("expected selected search node to run: %#v", instance.NodeStates)
+	}
+	if _, ok := instance.NodeStates["news"]; ok {
+		t.Fatalf("agent-directed routing should skip unselected static branch")
+	}
+	if got := instance.NodeStates["router"].Output["text"]; got != "route to search" {
+		t.Fatalf("expected structured text field to be preserved, got %#v", got)
 	}
 }
 
@@ -182,19 +298,25 @@ func TestTransformNodeRemoveFields(t *testing.T) {
 			},
 		},
 		Input: map[string]any{
-			"name":   "report",
-			"secret": "hidden",
-			"nested": map[string]any{"token": "hidden", "keep": true},
+			"value": map[string]any{
+				"name":   "report",
+				"secret": "hidden",
+				"nested": map[string]any{"token": "hidden", "keep": true},
+			},
 		},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := result.Output["secret"]; ok {
+	transformed := result.Output["result"].(map[string]any)
+	if _, ok := transformed["secret"]; ok {
 		t.Fatalf("secret field should be removed: %#v", result.Output)
 	}
-	nested := result.Output["nested"].(map[string]any)
+	nested := transformed["nested"].(map[string]any)
 	if _, ok := nested["token"]; ok {
 		t.Fatalf("nested token should be removed: %#v", nested)
+	}
+	if result.Output["removed_count"] != 2 {
+		t.Fatalf("unexpected removed count: %#v", result.Output["removed_count"])
 	}
 }

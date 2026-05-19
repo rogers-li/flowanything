@@ -118,13 +118,19 @@ func TestActionPlanningStrategyInvokesCapabilityAndFinalizes(t *testing.T) {
 	if len(model.requests) != 2 {
 		t.Fatalf("expected planning and final model calls, got %d", len(model.requests))
 	}
-	if model.requests[0].TraceContext.SpanID != runtimecontext.AgentPlanningSpanID("trace_plan", "agent_weather") {
+	if model.requests[0].TraceContext.SpanID != runtimecontext.AgentModelSpanID("trace_plan", "agent_weather", "planning") {
 		t.Fatalf("planning request should carry planning span: %#v", model.requests[0].TraceContext)
 	}
-	if model.requests[1].TraceContext.SpanID != runtimecontext.AgentFinalAnswerSpanID("trace_plan", "agent_weather") {
+	if model.requests[0].TraceContext.ParentSpanID != runtimecontext.AgentPlanningSpanID("trace_plan", "agent_weather") {
+		t.Fatalf("planning model request should be a child of planning span: %#v", model.requests[0].TraceContext)
+	}
+	if model.requests[1].TraceContext.SpanID != runtimecontext.AgentModelSpanID("trace_plan", "agent_weather", "final_answer") {
 		t.Fatalf("final answer request should carry final-answer span: %#v", model.requests[1].TraceContext)
 	}
-	if len(model.traceContexts) != 2 || model.traceContexts[0].SpanID != runtimecontext.AgentPlanningSpanID("trace_plan", "agent_weather") {
+	if model.requests[1].TraceContext.ParentSpanID != runtimecontext.AgentFinalAnswerSpanID("trace_plan", "agent_weather") {
+		t.Fatalf("final model request should be a child of final-answer span: %#v", model.requests[1].TraceContext)
+	}
+	if len(model.traceContexts) != 2 || model.traceContexts[0].SpanID != runtimecontext.AgentModelSpanID("trace_plan", "agent_weather", "planning") {
 		t.Fatalf("model ctx should carry trace context: %#v", model.traceContexts)
 	}
 	if len(result.Actions) != 1 || result.Actions[0].Action.ID != "tool_weather" {
@@ -141,6 +147,264 @@ func TestActionPlanningStrategyInvokesCapabilityAndFinalizes(t *testing.T) {
 	}
 	if !hasAgentEvent(events.Events, EventFinalAnswerCompleted) {
 		t.Fatalf("expected final answer completed event: %#v", events.Events)
+	}
+}
+
+func TestReWOOStrategyPlansExecutesAndSolvesWithoutObservationLoop(t *testing.T) {
+	model := &fakeModel{responses: []string{
+		`{"actions":[{"type":"tool","id":"tool_search","task":"search AI news","input":{"query":"AI news"},"reason":"needs fresh information"}]}`,
+		"Final answer from one ReWOO solve.",
+	}}
+	capabilities := NewMapCapabilityRegistry()
+	calls := 0
+	if err := capabilities.Register(CapabilityFunc{
+		Desc: CapabilityDescriptor{
+			ID:          "tool_search",
+			Type:        "tool",
+			Name:        "Search Tool",
+			Description: "Search web.",
+			InputSchema: []SchemaField{{
+				Name:     "query",
+				Type:     "string",
+				Required: true,
+			}},
+		},
+		Fn: func(_ Context, call CapabilityCall) (CapabilityResult, error) {
+			calls++
+			return CapabilityResult{
+				ID:     call.ID,
+				Type:   call.Type,
+				Text:   "search observation",
+				Output: map[string]any{"summary": "AI news"},
+			}, nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	events := &MemoryEventSink{}
+	runner := NewRunner(model, WithCapabilities(capabilities), WithEventSink(events))
+	result, err := runner.Run(context.Background(), AgentRunRequest{
+		TraceID:     "trace_rewoo",
+		UserMessage: "Search AI news",
+		Agent: AgentSpec{
+			ID:            "agent_research",
+			Prompt:        "You research topics.",
+			ReasoningMode: "rewoo",
+			Model:         ModelConfig{Provider: "fake", Model: "fake-model"},
+			Capabilities: []CapabilityDescriptor{{
+				ID:          "tool_search",
+				Type:        "tool",
+				Name:        "Search Tool",
+				Description: "Search web.",
+				InputSchema: []SchemaField{{
+					Name:     "query",
+					Type:     "string",
+					Required: true,
+				}},
+			}},
+			Policy: AgentPolicy{MaxIterations: 8, MaxActions: 8},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Text != "Final answer from one ReWOO solve." {
+		t.Fatalf("unexpected final answer: %q", result.Text)
+	}
+	if calls != 1 {
+		t.Fatalf("expected one capability call, got %d", calls)
+	}
+	if len(model.requests) != 2 {
+		t.Fatalf("ReWOO should only call planning and final answer models, got %d", len(model.requests))
+	}
+	for _, eventType := range []AgentEventType{EventPlanningStarted, EventPlanningCompleted, EventFinalAnswerCompleted} {
+		event := findAgentEvent(events.Events, eventType)
+		if event == nil || event.Strategy != "rewoo" {
+			t.Fatalf("expected %s event with rewoo strategy, got %#v", eventType, event)
+		}
+	}
+}
+
+func TestSkillCapabilityRunsSkillWithReWOOAndPrivateTools(t *testing.T) {
+	model := &fakeModel{responses: []string{
+		`{"actions":[{"type":"tool","id":"tool_search","task":"search AI news","input":{"query":"AI news"},"reason":"needs fresh information"}]}`,
+		"skill final answer",
+	}}
+	capabilities := NewMapCapabilityRegistry()
+	toolCalls := 0
+	if err := capabilities.Register(CapabilityFunc{
+		Desc: CapabilityDescriptor{
+			ID:          "tool_search",
+			Type:        "tool",
+			Name:        "Search Tool",
+			Description: "Search web.",
+		},
+		Fn: func(_ Context, call CapabilityCall) (CapabilityResult, error) {
+			toolCalls++
+			if call.Input["query"] != "AI news" {
+				t.Fatalf("unexpected tool input: %#v", call.Input)
+			}
+			return CapabilityResult{
+				ID:     call.ID,
+				Type:   call.Type,
+				Text:   "search observation",
+				Output: map[string]any{"summary": "AI news"},
+			}, nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	events := &MemoryEventSink{}
+	runner := NewRunner(model, WithCapabilities(capabilities), WithEventSink(events))
+	skill := NewSkillCapability(SkillSpec{
+		ID:            "skill_web_search",
+		Name:          "Web Search",
+		Description:   "Search and summarize web information.",
+		Prompt:        "Use the search tool and summarize the result.",
+		ReasoningMode: ReWOOStrategy{}.Name(),
+		Model:         ModelConfig{Provider: "fake", Model: "fake-model"},
+		Capabilities: []CapabilityDescriptor{{
+			ID:          "tool_search",
+			Type:        "tool",
+			Name:        "Search Tool",
+			Description: "Search web.",
+		}},
+		Policy: AgentPolicy{MaxActions: 3, MaxIterations: 3},
+	}, runner)
+
+	result, err := skill.Invoke(context.Background(), CapabilityCall{
+		ID:      "skill_web_search",
+		Type:    "skill",
+		Task:    "Find AI news",
+		Input:   map[string]any{"query": "AI news"},
+		TraceID: "trace_skill_rewoo",
+		TraceContext: runtimecontext.TraceContext{
+			TraceID: "trace_skill_rewoo",
+			SpanID:  "parent_capability_span",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Text != "skill final answer" {
+		t.Fatalf("unexpected skill result: %q", result.Text)
+	}
+	if toolCalls != 1 {
+		t.Fatalf("expected skill to invoke its tool once, got %d", toolCalls)
+	}
+	if len(model.requests) != 2 {
+		t.Fatalf("skill ReWOO should plan and solve once, got %d model calls", len(model.requests))
+	}
+	if len(model.requests[0].Tools) != 1 || model.requests[0].Tools[0].ID != "tool_search" {
+		t.Fatalf("skill planning should only expose skill tools, got %#v", model.requests[0].Tools)
+	}
+	if model.requests[0].TraceContext.ParentSpanID == "" {
+		t.Fatalf("skill model call should be linked into the parent trace: %#v", model.requests[0].TraceContext)
+	}
+	if event := findAgentEvent(events.Events, EventPlanningCompleted); event == nil || event.Strategy != "rewoo" {
+		t.Fatalf("expected skill planning to use rewoo, got %#v", event)
+	}
+}
+
+func TestActionPlanningStrategyResolvesCapabilityByName(t *testing.T) {
+	model := &fakeModel{responses: []string{
+		`{"actions":[{"type":"connector","id":"weather_lookup","task":"query weather","input":{"city":"Shanghai"},"reason":"user asked weather"}]}`,
+		"Shanghai is sunny.",
+	}}
+	capabilities := NewMapCapabilityRegistry()
+	calls := 0
+	if err := capabilities.Register(CapabilityFunc{
+		Desc: CapabilityDescriptor{
+			ID:          "tool_weather",
+			Type:        "tool",
+			Name:        "weather_lookup",
+			Description: "Query weather.",
+		},
+		Fn: func(_ Context, call CapabilityCall) (CapabilityResult, error) {
+			calls++
+			if call.ID != "tool_weather" || call.Type != "tool" {
+				t.Fatalf("capability call should use normalized descriptor identity, got id=%s type=%s", call.ID, call.Type)
+			}
+			return CapabilityResult{ID: call.ID, Type: call.Type, Text: "sunny"}, nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := NewRunner(model, WithCapabilities(capabilities))
+	result, err := runner.Run(context.Background(), AgentRunRequest{
+		TraceID:     "trace_plan_name_alias",
+		UserMessage: "How is weather in Shanghai?",
+		Agent: AgentSpec{
+			ID:            "agent_weather",
+			Prompt:        "You help with weather.",
+			ReasoningMode: "action-planning",
+			Model:         ModelConfig{Provider: "fake", Model: "fake-model"},
+			Capabilities: []CapabilityDescriptor{{
+				ID:          "tool_weather",
+				Type:        "tool",
+				Name:        "weather_lookup",
+				Description: "Query weather.",
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Text != "Shanghai is sunny." {
+		t.Fatalf("unexpected final answer: %q", result.Text)
+	}
+	if calls != 1 {
+		t.Fatalf("expected one normalized capability call, got %d", calls)
+	}
+	if len(result.Actions) != 1 || result.Actions[0].Action.ID != "tool_weather" || result.Actions[0].Action.Type != "tool" {
+		t.Fatalf("expected normalized action result, got %#v", result.Actions)
+	}
+}
+
+func TestActionPlanningStrategyDoesNotInvokeUnlistedGlobalCapability(t *testing.T) {
+	model := &fakeModel{responses: []string{
+		`{"actions":[{"type":"tool","id":"tool_weather","task":"query weather","input":{"city":"Shanghai"},"reason":"user asked weather"}]}`,
+		"I cannot call a weather tool because none is bound.",
+	}}
+	capabilities := NewMapCapabilityRegistry()
+	calls := 0
+	if err := capabilities.Register(CapabilityFunc{
+		Desc: CapabilityDescriptor{
+			ID:          "tool_weather",
+			Type:        "tool",
+			Name:        "weather_lookup",
+			Description: "Query weather.",
+		},
+		Fn: func(_ Context, call CapabilityCall) (CapabilityResult, error) {
+			calls++
+			return CapabilityResult{}, nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := NewRunner(model, WithCapabilities(capabilities))
+	result, err := runner.Run(context.Background(), AgentRunRequest{
+		TraceID:     "trace_plan_no_hidden_global",
+		UserMessage: "How is weather in Shanghai?",
+		Agent: AgentSpec{
+			ID:            "agent_weather",
+			Prompt:        "You help with weather.",
+			ReasoningMode: "action-planning",
+			Model:         ModelConfig{Provider: "fake", Model: "fake-model"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 0 {
+		t.Fatalf("unlisted global capability should not be invoked, got %d calls", calls)
+	}
+	if len(result.Actions) != 1 || result.Actions[0].Error != "capability not found" {
+		t.Fatalf("expected unlisted capability observation, got %#v", result.Actions)
 	}
 }
 
@@ -246,6 +510,260 @@ func TestReActStrategyLoopsThroughObservationBeforeFinalAnswer(t *testing.T) {
 	if !hasAgentEvent(events.Events, EventCapabilityCompleted) {
 		t.Fatalf("expected capability completed event: %#v", events.Events)
 	}
+	expectedCapabilitySpan := runtimecontext.AgentCapabilitySpanID("trace_react", "agent_research", "tool", "tool_search@1")
+	if event := findAgentEvent(events.Events, EventCapabilityStarted); event == nil || event.TraceContext.SpanID != expectedCapabilitySpan {
+		t.Fatalf("react capability event should use the same span as tool parent, got %#v", event)
+	}
+}
+
+func TestReActStrategyStopsRepeatedActionLoop(t *testing.T) {
+	model := &fakeModel{responses: []string{
+		`{"actions":[{"type":"tool","id":"tool_search","task":"search AI news","input":{"query":"AI news"},"reason":"need fresh information"}]}`,
+		`{"actions":[{"type":"tool","id":"tool_search","task":"search AI news","input":{"query":"AI news"},"reason":"need fresh information"}]}`,
+		"Final summary after one search.",
+	}}
+	capabilities := NewMapCapabilityRegistry()
+	calls := 0
+	if err := capabilities.Register(CapabilityFunc{
+		Desc: CapabilityDescriptor{
+			ID:          "tool_search",
+			Type:        "tool",
+			Name:        "Search Tool",
+			Description: "Search web.",
+			InputSchema: []SchemaField{{
+				Name:     "query",
+				Type:     "string",
+				Required: true,
+			}},
+		},
+		Fn: func(_ Context, call CapabilityCall) (CapabilityResult, error) {
+			calls++
+			return CapabilityResult{
+				ID:     call.ID,
+				Type:   call.Type,
+				Text:   "found repeated search result",
+				Output: map[string]any{"count": 3},
+			}, nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	events := &MemoryEventSink{}
+	runner := NewRunner(model, WithCapabilities(capabilities), WithEventSink(events))
+	result, err := runner.Run(context.Background(), AgentRunRequest{
+		TraceID:     "trace_react_loop_guard",
+		UserMessage: "Search AI news",
+		Agent: AgentSpec{
+			ID:            "agent_research",
+			Prompt:        "You research topics.",
+			ReasoningMode: "react",
+			Model:         ModelConfig{Provider: "fake", Model: "fake-model"},
+			Capabilities: []CapabilityDescriptor{{
+				ID:          "tool_search",
+				Type:        "tool",
+				Name:        "Search Tool",
+				Description: "Search web.",
+				InputSchema: []SchemaField{{
+					Name:     "query",
+					Type:     "string",
+					Required: true,
+				}},
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Text != "Final summary after one search." {
+		t.Fatalf("unexpected final answer: %q", result.Text)
+	}
+	if calls != 1 {
+		t.Fatalf("duplicate action should be skipped, got %d calls", calls)
+	}
+	if len(model.requests) != 3 {
+		t.Fatalf("expected first plan, repeated plan, and final answer calls, got %d", len(model.requests))
+	}
+	if !hasAgentEventWithData(events.Events, EventPlanningCompleted, "loop_breaker", true) {
+		t.Fatalf("expected loop breaker planning event: %#v", events.Events)
+	}
+}
+
+func TestRepeatedAgentActionIgnoresTaskWording(t *testing.T) {
+	attempted := map[string]struct{}{
+		plannedActionFingerprint(PlannedAction{Type: "agent", ID: "agent_research", Task: "search AI news"}): {},
+	}
+	next, duplicates := filterRepeatedActions([]PlannedAction{{
+		Type: "agent",
+		ID:   "agent_research",
+		Task: "search the latest AI news again with more details",
+		Input: map[string]any{
+			"user_request": "AI news",
+		},
+	}}, attempted)
+	if len(next) != 0 || len(duplicates) != 1 {
+		t.Fatalf("same agent should be treated as duplicate in one ReAct run, next=%#v duplicates=%#v", next, duplicates)
+	}
+}
+
+func TestRepeatedHighLevelCapabilityIgnoresTaskWording(t *testing.T) {
+	for _, capabilityType := range []string{"skill", "workflow"} {
+		attempted := map[string]struct{}{
+			plannedActionFingerprint(PlannedAction{Type: capabilityType, ID: "cap_web_search", Task: "search AI news"}): {},
+		}
+		next, duplicates := filterRepeatedActions([]PlannedAction{{
+			Type: capabilityType,
+			ID:   "cap_web_search",
+			Task: "search the latest AI news again with richer details",
+			Input: map[string]any{
+				"query": "AI news",
+			},
+		}}, attempted)
+		if len(next) != 0 || len(duplicates) != 1 {
+			t.Fatalf("same %s should be treated as duplicate in one ReAct run, next=%#v duplicates=%#v", capabilityType, next, duplicates)
+		}
+	}
+}
+
+func TestReActStrategyAcceptsNaturalFinalAnswerAfterObservation(t *testing.T) {
+	model := &fakeModel{responses: []string{
+		`{"actions":[{"type":"tool","id":"tool_search","task":"search weather","input":{"query":"深圳天气"},"reason":"need current weather"}]}`,
+		"深圳今天多云，局地有短时阵雨，出门建议带伞。",
+	}}
+	capabilities := NewMapCapabilityRegistry()
+	if err := capabilities.Register(CapabilityFunc{
+		Desc: CapabilityDescriptor{
+			ID:          "tool_search",
+			Type:        "tool",
+			Name:        "Search Tool",
+			Description: "Search web.",
+			InputSchema: []SchemaField{{
+				Name:     "query",
+				Type:     "string",
+				Required: true,
+			}},
+		},
+		Fn: func(_ Context, call CapabilityCall) (CapabilityResult, error) {
+			return CapabilityResult{
+				ID:     call.ID,
+				Type:   call.Type,
+				Text:   "深圳天气搜索结果",
+				Output: map[string]any{"summary": "多云，有短时阵雨"},
+			}, nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	events := &MemoryEventSink{}
+	runner := NewRunner(model, WithCapabilities(capabilities), WithEventSink(events))
+	result, err := runner.Run(context.Background(), AgentRunRequest{
+		TraceID:     "trace_react_natural_final",
+		UserMessage: "帮我查一下深圳天气",
+		Agent: AgentSpec{
+			ID:            "agent_weather",
+			Prompt:        "You answer weather questions.",
+			ReasoningMode: "react",
+			Model:         ModelConfig{Provider: "fake", Model: "fake-model"},
+			Capabilities: []CapabilityDescriptor{{
+				ID:          "tool_search",
+				Type:        "tool",
+				Name:        "Search Tool",
+				Description: "Search web.",
+				InputSchema: []SchemaField{{
+					Name:     "query",
+					Type:     "string",
+					Required: true,
+				}},
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Text != "深圳今天多云，局地有短时阵雨，出门建议带伞。" {
+		t.Fatalf("unexpected react answer: %q", result.Text)
+	}
+	if len(result.Actions) != 1 || result.Actions[0].Action.ID != "tool_search" {
+		t.Fatalf("expected one observed action, got %#v", result.Actions)
+	}
+	if !hasAgentEvent(events.Events, EventFinalAnswerCompleted) {
+		t.Fatalf("expected final answer completed event: %#v", events.Events)
+	}
+	if hasAgentEvent(events.Events, EventPlanningFailed) {
+		t.Fatalf("natural final answer after observation should not fail planning: %#v", events.Events)
+	}
+}
+
+func TestReActStrategyFinalizesMalformedActionPlanAfterObservation(t *testing.T) {
+	model := &fakeModel{responses: []string{
+		`{"actions":[{"type":"tool","id":"tool_search","task":"search AI news","input":{"query":"AI news"},"reason":"need fresh information"}]}`,
+		`我先查询新闻列表。
+
+{"actions":[{"type":"tool","id":"tool_search","task":"search AI news","input":{"query":"AI news"},"reason":"need fresh information"}]}`,
+		"这是整理后的 AI 新闻摘要。",
+	}}
+	capabilities := NewMapCapabilityRegistry()
+	if err := capabilities.Register(CapabilityFunc{
+		Desc: CapabilityDescriptor{ID: "tool_search", Type: "tool", Name: "Search Tool", Description: "Search web."},
+		Fn: func(_ Context, call CapabilityCall) (CapabilityResult, error) {
+			return CapabilityResult{ID: call.ID, Type: call.Type, Text: "found AI news"}, nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := NewRunner(model, WithCapabilities(capabilities))
+	result, err := runner.Run(context.Background(), AgentRunRequest{
+		TraceID:     "trace_react_malformed_plan_final",
+		UserMessage: "Search AI news",
+		Agent: AgentSpec{
+			ID:            "agent_research",
+			Prompt:        "You research topics.",
+			ReasoningMode: "react",
+			Model:         ModelConfig{Provider: "fake", Model: "fake-model"},
+			Capabilities:  []CapabilityDescriptor{{ID: "tool_search", Type: "tool", Name: "Search Tool", Description: "Search web."}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Text != "这是整理后的 AI 新闻摘要。" {
+		t.Fatalf("unexpected final answer: %q", result.Text)
+	}
+	if len(model.requests) != 3 {
+		t.Fatalf("expected first plan, malformed plan, and final answer calls, got %d", len(model.requests))
+	}
+}
+
+func TestStructuredFinalOutputUsesTextFieldAsResultText(t *testing.T) {
+	model := &fakeModel{responses: []string{`{"text":"请继续执行 Web Search Agent。","next_node_ids":["agent_web"]}`}}
+	runner := NewRunner(model)
+
+	result, err := runner.Run(context.Background(), AgentRunRequest{
+		TraceID:     "trace_structured_output_text",
+		UserMessage: "Search AI news",
+		Agent: AgentSpec{
+			ID:            "agent_router",
+			Prompt:        "Route the request.",
+			ReasoningMode: "direct",
+			Model:         ModelConfig{Provider: "fake", Model: "fake-model"},
+			OutputSchema: []SchemaField{
+				{Name: "text", Type: "string", Required: true},
+				{Name: "next_node_ids", Type: "array", Required: true},
+			},
+			Policy: AgentPolicy{ValidateFinalOutput: true},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Text != "请继续执行 Web Search Agent。" {
+		t.Fatalf("expected text field to be used as result text, got %q", result.Text)
+	}
+	if got := result.Output["next_node_ids"]; got == nil {
+		t.Fatalf("expected structured next_node_ids in output: %#v", result.Output)
+	}
 }
 
 func TestActionPlanningValidatesCapabilityInputSchema(t *testing.T) {
@@ -341,8 +859,24 @@ func TestDirectStrategyValidatesStructuredFinalOutputWhenEnabled(t *testing.T) {
 }
 
 func hasAgentEvent(events []AgentEvent, eventType AgentEventType) bool {
+	return findAgentEvent(events, eventType) != nil
+}
+
+func findAgentEvent(events []AgentEvent, eventType AgentEventType) *AgentEvent {
 	for _, event := range events {
 		if event.Type == eventType {
+			return &event
+		}
+	}
+	return nil
+}
+
+func hasAgentEventWithData(events []AgentEvent, eventType AgentEventType, key string, expected any) bool {
+	for _, event := range events {
+		if event.Type != eventType || event.Data == nil {
+			continue
+		}
+		if event.Data[key] == expected {
 			return true
 		}
 	}

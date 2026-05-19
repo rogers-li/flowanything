@@ -7,36 +7,36 @@ import (
 
 // AgentSpec is the runtime definition consumed by Agent Core.
 type AgentSpec struct {
-	ID            string
-	Name          string
-	Description   string
-	Prompt        string
-	ReasoningMode string
-	Model         ModelConfig
-	Capabilities  []CapabilityDescriptor
-	OutputSchema  []SchemaField
-	Policy        AgentPolicy
+	ID            string                 `json:"id"`
+	Name          string                 `json:"name"`
+	Description   string                 `json:"description"`
+	Prompt        string                 `json:"prompt"`
+	ReasoningMode string                 `json:"reasoning_mode"`
+	Model         ModelConfig            `json:"model"`
+	Capabilities  []CapabilityDescriptor `json:"capabilities"`
+	OutputSchema  []SchemaField          `json:"output_schema"`
+	Policy        AgentPolicy            `json:"policy"`
 }
 
 // ModelConfig keeps provider-specific model settings outside the reasoning
 // strategy implementation.
 type ModelConfig struct {
-	Provider    string
-	Model       string
-	Temperature float64
-	MaxTokens   int
+	Provider    string  `json:"provider"`
+	Model       string  `json:"model"`
+	Temperature float64 `json:"temperature"`
+	MaxTokens   int     `json:"max_tokens"`
 }
 
 // AgentPolicy keeps agent execution bounded and observable. Zero values are
 // normalized by the runner so configs can stay compact.
 type AgentPolicy struct {
-	MaxIterations       int
-	MaxActions          int
-	ValidateFinalOutput bool
-	MaxContextTokens    int
-	MaxHistoryMessages  int
-	MaxMemoryItems      int
-	MaxMessageChars     int
+	MaxIterations       int  `json:"max_iterations"`
+	MaxActions          int  `json:"max_actions"`
+	ValidateFinalOutput bool `json:"validate_final_output"`
+	MaxContextTokens    int  `json:"max_context_tokens"`
+	MaxHistoryMessages  int  `json:"max_history_messages"`
+	MaxMemoryItems      int  `json:"max_memory_items"`
+	MaxMessageChars     int  `json:"max_message_chars"`
 }
 
 // SchemaField describes capability and agent input/output contracts. The
@@ -84,12 +84,12 @@ type Context interface {
 
 // CapabilityDescriptor is what the LLM sees.
 type CapabilityDescriptor struct {
-	ID           string
-	Type         string
-	Name         string
-	Description  string
-	InputSchema  []SchemaField
-	OutputSchema []SchemaField
+	ID           string        `json:"id"`
+	Type         string        `json:"type"`
+	Name         string        `json:"name"`
+	Description  string        `json:"description"`
+	InputSchema  []SchemaField `json:"input_schema"`
+	OutputSchema []SchemaField `json:"output_schema"`
 }
 
 // Capability is the common abstraction for tools, skills, sub-agents, workflow

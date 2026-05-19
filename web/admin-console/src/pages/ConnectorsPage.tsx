@@ -332,6 +332,7 @@ export function ConnectorsPage() {
       const secretRef = connectorSecretRefForDraft(connectorDraft);
       const secretEnvName = connectorSecretEnvName(connectorDraft);
       const requiresSecret = connectorAuthRequiresEnvironmentSecret(connectorDraft.authType);
+      const isOAuth2 = connectorDraft.authType === "oauth2";
 
       return (
         <article className="tool-editor-panel">
@@ -380,15 +381,19 @@ export function ConnectorsPage() {
                   <option value="oauth2">oauth2</option>
                 </select>
               </label>
-              <div className="connector-secret-ref-card" aria-live="polite">
-                <span>{requiresSecret ? "Environment Variable" : "Secret Reference"}</span>
-                <code>{requiresSecret ? secretRef : "No secret required"}</code>
-                <p>
-                  {requiresSecret
-                    ? `Configure ${secretEnvName} in the service runtime environment. The console never accepts or stores the actual API key.`
-                    : "This auth type does not require an API key value in the connector console."}
-                </p>
-              </div>
+              {isOAuth2 ? (
+                <OAuth2SecretReferenceCard config={connectorDraft.authConfig} />
+              ) : (
+                <div className="connector-secret-ref-card" aria-live="polite">
+                  <span>{requiresSecret ? "Environment Variable" : "Secret Reference"}</span>
+                  <code>{requiresSecret ? secretRef : "No secret required"}</code>
+                  <p>
+                    {requiresSecret
+                      ? `Configure ${secretEnvName} in the service runtime environment. The console never accepts or stores the actual API key.`
+                      : "This auth type does not require an API key value in the connector console."}
+                  </p>
+                </div>
+              )}
             </div>
             <section>
               <h3>Shared Headers</h3>
@@ -641,6 +646,40 @@ function ConnectorStepNav({
       })}
     </nav>
   );
+}
+
+function OAuth2SecretReferenceCard({ config }: { config?: Record<string, unknown> }) {
+  const provider = stringFromConfig(config, "provider") || "oauth2";
+  const clientIdRef = stringFromConfig(config, "client_id_ref") || "Not configured";
+  const clientSecretRef = stringFromConfig(config, "client_secret_ref") || "Not configured";
+  const tokenURL = stringFromConfig(config, "tenant_access_token_url") || stringFromConfig(config, "access_token_url") || "Default provider token URL";
+
+  return (
+    <div className="connector-secret-ref-card" aria-live="polite">
+      <span>OAuth2 Secret References</span>
+      <code>{provider}</code>
+      <p>Runtime reads these environment references to generate access tokens. The console never accepts or stores actual secret values.</p>
+      <dl className="connector-auth-ref-list">
+        <div>
+          <dt>Client ID</dt>
+          <dd>{clientIdRef}</dd>
+        </div>
+        <div>
+          <dt>Client Secret</dt>
+          <dd>{clientSecretRef}</dd>
+        </div>
+        <div>
+          <dt>Token URL</dt>
+          <dd>{tokenURL}</dd>
+        </div>
+      </dl>
+    </div>
+  );
+}
+
+function stringFromConfig(config: Record<string, unknown> | undefined, key: string): string {
+  const value = config?.[key];
+  return typeof value === "string" ? value : "";
 }
 
 function buildConnectorGroups(connectors: Connector[], operations: ConnectorOperation[]): ConnectorGroup[] {

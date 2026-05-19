@@ -152,6 +152,58 @@ func TestStatefulExecutorParallelJoinWaitsForAllBranches(t *testing.T) {
 	}
 }
 
+func TestStatefulExecutorEmitsNodeLifecycleMetadata(t *testing.T) {
+	registry := NewDefaultRegistry()
+	if err := registry.Register(FuncNodeExecutor{
+		NodeType: "business.echo",
+		Fn: func(_ context.Context, req NodeRequest) (NodeResult, error) {
+			return NodeResult{Output: map[string]any{"message": req.Input["message"]}}, nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	events := &MemoryEventSink{}
+	executor := NewStatefulExecutor(
+		registry,
+		NewMemoryInstanceStore(),
+		WithStatefulEventSink(events),
+		WithInstanceIDFunc(func() string { return "instance_events" }),
+		WithTokenIDFunc(sequenceID("token_events")),
+	)
+
+	_, err := executor.Start(context.Background(), FlowSpec{
+		ID: "flow_events",
+		Nodes: []NodeSpec{{
+			ID:   "echo",
+			Type: "business.echo",
+			Name: "Echo Node",
+			InputMappings: []FieldBinding{{
+				Field:   "message",
+				Enabled: true,
+				Source:  ValueSource{Type: SourceContext, Path: "$.flow_input.message"},
+			}},
+		}},
+	}, map[string]any{"message": "hello"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	started := findFlowEvent(events.Events, EventNodeStarted, "echo")
+	if started == nil {
+		t.Fatalf("expected node started event: %#v", events.Events)
+	}
+	if started.Data["node_name"] != "Echo Node" {
+		t.Fatalf("expected node name in started event data, got %#v", started.Data)
+	}
+	completed := findFlowEvent(events.Events, EventNodeCompleted, "echo")
+	if completed == nil {
+		t.Fatalf("expected node completed event: %#v", events.Events)
+	}
+	if completed.Data["node_name"] != "Echo Node" {
+		t.Fatalf("expected node name in completed event data, got %#v", completed.Data)
+	}
+}
+
 func boolText(value any) string {
 	if value == true {
 		return "true"
@@ -174,4 +226,13 @@ func hasFlowEvent(events []FlowEvent, eventType FlowEventType) bool {
 		}
 	}
 	return false
+}
+
+func findFlowEvent(events []FlowEvent, eventType FlowEventType, nodeID string) *FlowEvent {
+	for i := range events {
+		if events[i].Type == eventType && events[i].NodeID == nodeID {
+			return &events[i]
+		}
+	}
+	return nil
 }

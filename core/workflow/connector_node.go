@@ -46,12 +46,12 @@ func (e ConnectorNodeExecutor) Execute(ctx context.Context, req flowengine.NodeR
 		OperationID:  config.OperationID,
 		Input:        req.Input,
 		Metadata:     config.Metadata,
-		TraceContext: traceContextFrom(ctx),
+		TraceContext: childTraceContextFrom(ctx),
 	})
 	if err != nil {
 		return flowengine.NodeResult{}, err
 	}
-	output := result.Output
+	output := connectorNodeOutput(result)
 	if output == nil {
 		output = map[string]any{}
 	}
@@ -64,7 +64,54 @@ func (e ConnectorNodeExecutor) Execute(ctx context.Context, req flowengine.NodeR
 	return flowengine.NodeResult{Output: output}, nil
 }
 
-func traceContextFrom(ctx context.Context) runtimecontext.TraceContext {
+func connectorNodeOutput(result ConnectorInvokeResult) map[string]any {
+	output := copyMap(result.Output)
+	if !isHTTPEnvelope(output) {
+		return output
+	}
+	body, ok := output["body"].(map[string]any)
+	if !ok {
+		return output
+	}
+	normalized := copyMap(body)
+	normalized["_connector"] = connectorEnvelope(output, result.Raw)
+	return normalized
+}
+
+func isHTTPEnvelope(output map[string]any) bool {
+	if output == nil {
+		return false
+	}
+	_, hasBody := output["body"]
+	_, hasStatusCode := output["status_code"]
+	_, hasSuccess := output["success"]
+	return hasBody && (hasStatusCode || hasSuccess)
+}
+
+func connectorEnvelope(output map[string]any, raw any) map[string]any {
+	envelope := copyMap(output)
+	if raw != nil {
+		envelope["raw"] = raw
+	}
+	return envelope
+}
+
+func copyMap(input map[string]any) map[string]any {
+	if input == nil {
+		return nil
+	}
+	output := make(map[string]any, len(input))
+	for key, value := range input {
+		output[key] = value
+	}
+	return output
+}
+
+func childTraceContextFrom(ctx context.Context) runtimecontext.TraceContext {
 	traceContext, _ := runtimecontext.TraceContextFrom(ctx)
-	return traceContext
+	return runtimecontext.TraceContext{
+		TraceID:       traceContext.TraceID,
+		ParentSpanID:  traceContext.SpanID,
+		CorrelationID: traceContext.CorrelationID,
+	}
 }

@@ -10,6 +10,11 @@ export default defineConfig({
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/platform-api/, "")
       },
+      "/ai-platform-runtime": {
+        target: "http://localhost:8081",
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/ai-platform-runtime/, "")
+      },
       "/agent-runtime": {
         target: "http://localhost:8082",
         changeOrigin: true,

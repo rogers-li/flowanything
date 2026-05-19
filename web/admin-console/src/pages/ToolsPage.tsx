@@ -15,9 +15,13 @@ import {
   toolFromDraft,
   type ToolDraft
 } from "../features/tools/domain";
+import { workflowConfigFromSpec, workflowSpecFromConfig } from "../features/tools/configModel";
 import { useTools } from "../features/tools/useTools";
-import { defaultTenantId, platformApi } from "../lib/api";
+import { resourceApi } from "../platform/configApi";
+import type { WorkflowConfig } from "../platform/configTypes";
 import type { Connector, ConnectorOperation, ToolExecutionResult, ToolSpec, WorkflowSpec } from "../types/platform";
+
+const localTenantId = "tenant_1";
 
 const riskTone = {
   low: "green",
@@ -147,6 +151,7 @@ export function ToolsPage() {
   const [sourceFilter, setSourceFilter] = useState<ToolSourceFilter>("all");
   const [statusFilter, setStatusFilter] = useState<ToolStatusFilter>("enabled");
   const {
+    activeBundleId,
     tools,
     connectorSystems,
     connectors,
@@ -384,10 +389,10 @@ export function ToolsPage() {
         name: toolDraft.name || "Untitled Tool Workflow",
         description: toolDraft.description || "Compose connector operations and tools into one governed capability."
       },
-      defaultTenantId
+      localTenantId
     );
     const base = workflow ?? fallbackWorkflow;
-    const toolSpec = toolFromDraft(toolDraft, defaultTenantId);
+    const toolSpec = toolFromDraft(toolDraft, localTenantId);
     return {
       ...base,
       profile: "tool_workflow",
@@ -414,7 +419,14 @@ export function ToolsPage() {
 
   const saveWorkflowCanvas = async (workflow: WorkflowSpec) => {
     try {
-      const savedWorkflow = workflow.id ? await platformApi.updateWorkflow(workflow) : await platformApi.createWorkflow(workflow);
+      if (!activeBundleId) {
+        throw new Error("Create or select a draft Bundle before saving Workflow Tools.");
+      }
+      const current = workflow.id ? await fetchCurrentWorkflowConfig(activeBundleId, workflow.id) : undefined;
+      const config = workflowConfigFromSpec(workflow, current);
+      const response = await resourceApi.upsertResource(activeBundleId, "workflow", config);
+      const savedWorkflowConfig = response.bundle.resources?.workflows?.find((item) => item.id === config.id) ?? config;
+      const savedWorkflow = workflowSpecFromConfig(savedWorkflowConfig);
       setWorkflowCanvasSpec(savedWorkflow);
       upsertWorkflow(savedWorkflow);
       const nextDraft = {
@@ -428,7 +440,10 @@ export function ToolsPage() {
         status: draft.status === "draft" ? "disabled" : draft.status
       };
       setDraft(nextDraft);
-      await saveDraft(nextDraft);
+      const savedTool = await saveDraft(nextDraft);
+      if (savedTool) {
+        setActiveSection("basic");
+      }
     } catch (error) {
       // Keep the editor open; the shared notice system will surface saveDraft
       // failures, and workflow save failures are shown inline here.
@@ -1886,25 +1901,7 @@ function mergeMCPImportedTools(current: MCPImportedToolDraft[], discovered: MCPI
 }
 
 async function discoverMCPToolsFromServer(server: MCPServerImportDraft): Promise<MCPImportedToolDraft[]> {
-  const response = await platformApi.discoverMCPTools({
-    name: server.name.trim(),
-    url: server.url.trim(),
-    transport: server.transport,
-    headers: server.headers
-      .filter((header) => header.name.trim())
-      .map((header) => ({ name: header.name.trim(), value: header.value })),
-    require_authorization: server.requireAuthorization
-  });
-  return response.tools.map((tool) => ({
-    id: createLocalDraftID("mcp_tool"),
-    name: tool.name,
-    description: tool.description,
-    inputFields: schemaFieldsFromToolSchema(tool.inputSchema),
-    outputFields: schemaFieldsFromToolSchema(tool.outputSchema),
-    authRequired: server.requireAuthorization,
-    timeoutSeconds: 60,
-    status: "disabled"
-  }));
+  throw new Error(`MCP discovery is not available in the new config runtime yet. Define MCP tools manually for server "${server.name.trim()}".`);
 }
 
 function createMCPImportedTool(name: string, description: string, inputFields: SchemaFieldDraft[]): MCPImportedToolDraft {
@@ -1942,7 +1939,7 @@ function toolSpecFromMCPImport(server: MCPServerImportDraft, importedTool: MCPIm
       timeoutMillis: Math.max(1, importedTool.timeoutSeconds) * 1000,
       status: importedTool.status ?? "disabled"
     },
-    defaultTenantId
+    localTenantId
   );
   return {
     ...spec,
@@ -2012,7 +2009,7 @@ function toolSpecFromConnectorImport(
       timeoutMillis: importedTool.timeoutMillis,
       status: importedTool.status ?? "disabled"
     },
-    defaultTenantId
+    localTenantId
   );
   return spec;
 }
@@ -2222,6 +2219,15 @@ function stepsForImplementation(implementation: ToolSpec["implementation"]): Arr
     { key: "parameters", label: "Parameter Configuration" },
     { key: "test", label: "Test" }
   ];
+}
+
+async function fetchCurrentWorkflowConfig(bundleId: string, workflowId: string): Promise<WorkflowConfig | undefined> {
+  try {
+    const document = await resourceApi.getResource<WorkflowConfig>(bundleId, "workflow", workflowId);
+    return document.resource;
+  } catch {
+    return undefined;
+  }
 }
 
 function draftWithWorkflowSchema(draft: ToolDraft, workflow?: WorkflowSpec): ToolDraft {

@@ -23,7 +23,7 @@ func TestCollectorBuildsFlowTree(t *testing.T) {
 	})
 	collector.OnFlowEvent(ctx, flowengine.FlowEvent{
 		Type: flowengine.EventNodeStarted, RunID: "run_1", FlowID: "flow_1", NodeID: "node_agent", NodeType: "workflow.agent",
-		Input: map[string]any{"message": "hello"}, Timestamp: base.Add(time.Second),
+		Input: map[string]any{"message": "hello"}, Data: map[string]any{"node_name": "Agent Node"}, Timestamp: base.Add(time.Second),
 	})
 	collector.OnFlowEvent(ctx, flowengine.FlowEvent{
 		Type: flowengine.EventNodeCompleted, RunID: "run_1", FlowID: "flow_1", NodeID: "node_agent", NodeType: "workflow.agent",
@@ -47,6 +47,9 @@ func TestCollectorBuildsFlowTree(t *testing.T) {
 	}
 	if len(tree[0].Children) != 1 || tree[0].Children[0].Span.Kind != SpanKindNode {
 		t.Fatalf("expected node child: %#v", tree)
+	}
+	if tree[0].Children[0].Span.Name != "Agent Node" {
+		t.Fatalf("expected node display name, got %q", tree[0].Children[0].Span.Name)
 	}
 	if tree[0].Children[0].Span.Output["answer"] != "hi" {
 		t.Fatalf("unexpected node output: %#v", tree[0].Children[0].Span.Output)
@@ -101,6 +104,15 @@ func TestCollectorLinksAgentToolConnectorWithTraceContext(t *testing.T) {
 		Type: agentcore.EventCapabilityCompleted, TraceID: traceID, AgentID: "agent_web", Strategy: "action-planning",
 		CapabilityID: "tool_search", CapabilityType: "tool", Timestamp: base.Add(8 * time.Second),
 	})
+	skillCapabilitySpan := capabilitySpanID(traceID, "agent_web", "skill", "skill_web")
+	collector.OnAgentEvent(agentCtx, agentcore.AgentEvent{
+		Type: agentcore.EventCapabilityStarted, TraceID: traceID, AgentID: "agent_web", Strategy: "action-planning",
+		CapabilityID: "skill_web", CapabilityType: "skill", Timestamp: base.Add(8*time.Second + time.Millisecond),
+	})
+	collector.OnAgentEvent(agentCtx, agentcore.AgentEvent{
+		Type: agentcore.EventCapabilityCompleted, TraceID: traceID, AgentID: "agent_web", Strategy: "action-planning",
+		CapabilityID: "skill_web", CapabilityType: "skill", Timestamp: base.Add(8*time.Second + 2*time.Millisecond),
+	})
 	collector.OnAgentEvent(agentCtx, agentcore.AgentEvent{
 		Type: agentcore.EventAgentCompleted, TraceID: traceID, AgentID: "agent_web", Strategy: "action-planning",
 		Data: map[string]any{"text": "done"}, Timestamp: base.Add(9 * time.Second),
@@ -128,6 +140,9 @@ func TestCollectorLinksAgentToolConnectorWithTraceContext(t *testing.T) {
 	}
 	if toolSpanValue.Input["authorization"] != "[redacted]" {
 		t.Fatalf("tool input should be redacted: %#v", toolSpanValue.Input)
+	}
+	if skillSpan := spansByID[skillCapabilitySpan]; skillSpan.Kind != SpanKindSkill {
+		t.Fatalf("skill capability should create skill span, got %#v", skillSpan)
 	}
 	planningSpan := spansByID[planningSpanID(traceID, "agent_web")]
 	if planningSpan.Input["api_key"] != "[redacted]" {
