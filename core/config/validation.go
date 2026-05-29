@@ -1,10 +1,12 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
 
+	"flow-anything/core/agentcore"
 	coreschema "flow-anything/core/schema"
 )
 
@@ -68,7 +70,7 @@ func ValidateBundle(bundle BundleSpec) error {
 	validateAgents(&errs, index, bundle.Resources.Agents)
 	validateSkills(&errs, index, bundle.Resources.Skills)
 	validateTools(&errs, index, bundle.Resources.Tools)
-	validateWorkflows(&errs, bundle.Resources.Workflows)
+	validateWorkflows(&errs, index, bundle.Resources.Workflows, bundle.Resources.Skills)
 	validateConnectors(&errs, bundle.Resources.Connectors)
 	validateModels(&errs, bundle.Resources.Models)
 	validateKnowledge(&errs, index, bundle.Resources.KnowledgeBases)
@@ -159,7 +161,8 @@ func validateToolImplementationRef(errs *ValidationErrors, index Index, path str
 	}
 }
 
-func validateWorkflows(errs *ValidationErrors, workflows []WorkflowConfig) {
+func validateWorkflows(errs *ValidationErrors, index Index, workflows []WorkflowConfig, skills []SkillConfig) {
+	skillTools := skillToolIndex(skills)
 	for _, workflow := range workflows {
 		path := "resources.workflows." + workflow.ID
 		validateMeta(errs, path, workflow.ResourceMeta)
@@ -183,6 +186,7 @@ func validateWorkflows(errs *ValidationErrors, workflows []WorkflowConfig) {
 			if node.Type == "" {
 				errs.Add(nodePath+".type", "node type is required")
 			}
+			validateWorkflowAgentNodeCapabilities(errs, index, nodePath, node.Type, node.Config, skillTools)
 		}
 		for _, edge := range workflow.Spec.Edges {
 			if !seen[edge.From] || !seen[edge.To] {
@@ -191,6 +195,93 @@ func validateWorkflows(errs *ValidationErrors, workflows []WorkflowConfig) {
 		}
 		validateRuntimeRequirement(errs, path+".runtime", workflow.Runtime)
 	}
+}
+
+type workflowAgentNodeConfig struct {
+	Agent agentcore.AgentSpec `json:"agent"`
+}
+
+func validateWorkflowAgentNodeCapabilities(errs *ValidationErrors, index Index, path string, nodeType string, config map[string]any, skillTools map[string]map[string]struct{}) {
+	if nodeType != "workflow.agent" {
+		return
+	}
+	var decoded workflowAgentNodeConfig
+	if err := decodeWorkflowNodeConfig(config, &decoded); err != nil {
+		errs.Add(path+".config", "invalid agent node config: "+err.Error())
+		return
+	}
+	if decoded.Agent.ID == "" {
+		errs.Add(path+".config.agent.id", "agent id is required")
+	}
+	seen := map[string]struct{}{}
+	skills := map[string]struct{}{}
+	tools := map[string]struct{}{}
+	for i, capability := range decoded.Agent.Capabilities {
+		capPath := fmt.Sprintf("%s.config.agent.capabilities[%d]", path, i)
+		if capability.ID == "" {
+			errs.Add(capPath+".id", "capability id is required")
+			continue
+		}
+		if capability.Type == "" {
+			errs.Add(capPath+".type", "capability type is required")
+			continue
+		}
+		key := capability.Type + ":" + capability.ID
+		if _, ok := seen[key]; ok {
+			errs.Add(capPath, fmt.Sprintf("duplicate capability %q", key))
+			continue
+		}
+		seen[key] = struct{}{}
+		switch ResourceKind(capability.Type) {
+		case ResourceSkill:
+			validateRef(errs, index, capPath, ResourceRef{Kind: ResourceSkill, ID: capability.ID}, ResourceSkill)
+			skills[capability.ID] = struct{}{}
+		case ResourceTool:
+			validateRef(errs, index, capPath, ResourceRef{Kind: ResourceTool, ID: capability.ID}, ResourceTool)
+			tools[capability.ID] = struct{}{}
+		case ResourceWorkflow:
+			validateRef(errs, index, capPath, ResourceRef{Kind: ResourceWorkflow, ID: capability.ID}, ResourceWorkflow)
+		case ResourceKnowledge:
+			validateRef(errs, index, capPath, ResourceRef{Kind: ResourceKnowledge, ID: capability.ID}, ResourceKnowledge)
+		case ResourceAgent:
+			// Agent Graph local child agents are embedded in workflow nodes and
+			// may not exist as top-level resources, so reference validation is
+			// intentionally relaxed for agent capabilities.
+		default:
+			errs.Add(capPath+".type", fmt.Sprintf("unsupported capability type %q", capability.Type))
+		}
+	}
+	for skillID := range skills {
+		ownedTools := skillTools[skillID]
+		for toolID := range tools {
+			if _, ok := ownedTools[toolID]; ok {
+				errs.Add(path+".config.agent.capabilities", fmt.Sprintf("tool capability %q is owned by skill capability %q; remove the inherited tool from the parent agent capability list", toolID, skillID))
+			}
+		}
+	}
+}
+
+func decodeWorkflowNodeConfig(config map[string]any, target any) error {
+	data, err := json.Marshal(config)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(data, target)
+}
+
+func skillToolIndex(skills []SkillConfig) map[string]map[string]struct{} {
+	out := map[string]map[string]struct{}{}
+	for _, skill := range skills {
+		tools := map[string]struct{}{}
+		for _, binding := range skill.Tools {
+			if binding.Disabled || binding.Ref.ID == "" {
+				continue
+			}
+			tools[binding.Ref.ID] = struct{}{}
+		}
+		out[skill.ID] = tools
+	}
+	return out
 }
 
 func validateConnectors(errs *ValidationErrors, connectors []ConnectorConfig) {

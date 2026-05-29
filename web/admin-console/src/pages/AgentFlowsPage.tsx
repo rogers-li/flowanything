@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useId, useMemo, useState, type ReactNode } from "react";
 import {
   Background,
   Controls,
@@ -109,9 +109,6 @@ type FlowTestSessionRecord = {
   updatedAt: string;
 };
 
-const flowTestSessionStorageKey = "flow-anything.agent-flow-test-sessions.v1";
-const maxFlowTestSessionsPerFlow = 24;
-
 const flowStatusTone = {
   draft: "gray",
   enabled: "green",
@@ -180,78 +177,20 @@ function flowTestSessionFlowKey(flow: AgentFlowSpec): string {
   return flow.id || flow.graph.id || flow.name || "draft_agent_flow";
 }
 
-function isFlowTestSessionRecord(value: unknown): value is FlowTestSessionRecord {
-  if (!value || typeof value !== "object") return false;
-  const record = value as Partial<FlowTestSessionRecord>;
-  return (
-    typeof record.createdAt === "string" &&
-    typeof record.flowKey === "string" &&
-    typeof record.flowName === "string" &&
-    Array.isArray(record.messages) &&
-    typeof record.sessionId === "string" &&
-    typeof record.updatedAt === "string"
-  );
-}
-
-function readAllFlowTestSessions(): FlowTestSessionRecord[] {
-  if (typeof window === "undefined") return [];
-  try {
-    const raw = window.localStorage.getItem(flowTestSessionStorageKey);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw) as unknown;
-    return Array.isArray(parsed)
-      ? parsed.filter(isFlowTestSessionRecord).map((session) => ({ ...session, messages: messagesForHistory(session.messages) }))
-      : [];
-  } catch {
-    return [];
-  }
-}
-
-function readFlowTestSessions(flow: AgentFlowSpec): FlowTestSessionRecord[] {
+function flowTestSessionsFromRunHistory(flow: AgentFlowSpec, records: RunRecord[]): FlowTestSessionRecord[] {
   const flowKey = flowTestSessionFlowKey(flow);
-  return readAllFlowTestSessions()
-    .filter((session) => session.flowKey === flowKey)
+  const grouped = new Map<string, RunRecord[]>();
+  records
+    .filter((record) => runRecordMatchesFlow(record, flow))
+    .forEach((record) => {
+      const sessionKey = record.session_id || record.id;
+      grouped.set(sessionKey, [...(grouped.get(sessionKey) ?? []), record]);
+    });
+
+  return Array.from(grouped.entries())
+    .map(([sessionId, sessionRuns]) => flowTestSessionFromRunRecords(flow, flowKey, sessionId, sessionRuns))
+    .filter((session) => session.messages.length > 0)
     .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
-}
-
-function persistFlowTestSession(flow: AgentFlowSpec, sessionId: string, messages: DebugChatMessage[]) {
-  if (typeof window === "undefined" || messages.length === 0) return;
-
-  const flowKey = flowTestSessionFlowKey(flow);
-  const now = new Date().toISOString();
-  const historyMessages = completedFlowTestMessagesForHistory(messages);
-  if (historyMessages.length === 0) return;
-  const allSessions = readAllFlowTestSessions();
-  const existing = allSessions.find((session) => session.flowKey === flowKey && session.sessionId === sessionId);
-  const messagesChanged = existing ? flowTestMessagesKey(existing.messages) !== flowTestMessagesKey(historyMessages) : true;
-  const nextRecord: FlowTestSessionRecord = {
-    createdAt: existing?.createdAt ?? now,
-    flowKey,
-    flowName: flow.name || flow.graph.name || "Untitled Agent Flow",
-    messages: historyMessages,
-    sessionId,
-    updatedAt: messagesChanged ? now : existing?.updatedAt ?? now
-  };
-
-  const merged = [
-    nextRecord,
-    ...allSessions.filter((session) => !(session.flowKey === flowKey && session.sessionId === sessionId))
-  ].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
-  const keptCurrentFlowSessionIds = new Set(
-    merged
-      .filter((session) => session.flowKey === flowKey)
-      .slice(0, maxFlowTestSessionsPerFlow)
-      .map((session) => session.sessionId)
-  );
-
-  try {
-    window.localStorage.setItem(
-      flowTestSessionStorageKey,
-      JSON.stringify(merged.filter((session) => session.flowKey !== flowKey || keptCurrentFlowSessionIds.has(session.sessionId)))
-    );
-  } catch {
-    // Local history is convenience data. Runtime execution must not fail if browser storage is unavailable.
-  }
 }
 
 function formatFlowTestSessionTime(value: string): string {
@@ -315,10 +254,6 @@ function isFlowProgressMessage(message: DebugChatMessage): boolean {
   );
 }
 
-function flowTestMessagesKey(messages: DebugChatMessage[]): string {
-  return JSON.stringify(messagesForHistory(messages));
-}
-
 type AgentFlowsPageProps = {
   onExit?: () => void;
 };
@@ -340,8 +275,7 @@ export function AgentFlowsPage({ onExit }: AgentFlowsPageProps = {}) {
   const [flowTestMessages, setFlowTestMessages] = useState<DebugChatMessage[]>([]);
   const [flowTestSessions, setFlowTestSessions] = useState<FlowTestSessionRecord[]>([]);
   const [isFlowTestHistoryOpen, setIsFlowTestHistoryOpen] = useState(false);
-  const [flowDebugSessionId, setFlowDebugSessionId] = useState(() => createClientID("flow_debug_session"));
-  const restoredFlowHistorySnapshotRef = useRef<{ messagesKey: string; sessionId: string } | null>(null);
+  const [flowDebugSessionId, setFlowDebugSessionId] = useState("");
   const [activeFlowTrace, setActiveFlowTrace] = useState<AgentTrace | null>(null);
   const [nodeTestInput, setNodeTestInput] = useState("帮我搜索一下今天的 AI 新闻，并总结重点");
   const [nodeTestMessages, setNodeTestMessages] = useState<DebugChatMessage[]>([]);
@@ -420,23 +354,8 @@ export function AgentFlowsPage({ onExit }: AgentFlowsPageProps = {}) {
   }, [selectedNodeId]);
 
   useEffect(() => {
-    setFlowTestSessions(readFlowTestSessions(selectedFlow));
+    void refreshFlowTestSessions(selectedFlow);
   }, [selectedFlow.graph.id, selectedFlow.id]);
-
-  useEffect(() => {
-    const restoredSnapshot = restoredFlowHistorySnapshotRef.current;
-    if (
-      restoredSnapshot &&
-      restoredSnapshot.sessionId === flowDebugSessionId &&
-      restoredSnapshot.messagesKey === flowTestMessagesKey(flowTestMessages)
-    ) {
-      restoredFlowHistorySnapshotRef.current = null;
-      setFlowTestSessions(readFlowTestSessions(selectedFlow));
-      return;
-    }
-    persistFlowTestSession(selectedFlow, flowDebugSessionId, flowTestMessages);
-    setFlowTestSessions(readFlowTestSessions(selectedFlow));
-  }, [flowDebugSessionId, flowTestMessages, selectedFlow.graph.id, selectedFlow.id, selectedFlow.name]);
 
   async function loadInitialData() {
     if (!workspace.activeBundleId) {
@@ -472,6 +391,15 @@ export function AgentFlowsPage({ onExit }: AgentFlowsPageProps = {}) {
         ok: false,
         message: error instanceof Error ? error.message : "Failed to load Agent Flow resources."
       });
+    }
+  }
+
+  async function refreshFlowTestSessions(flow: AgentFlowSpec) {
+    try {
+      const { items } = await runHistoryApi.list();
+      setFlowTestSessions(flowTestSessionsFromRunHistory(flow, items));
+    } catch {
+      setFlowTestSessions([]);
     }
   }
 
@@ -725,10 +653,13 @@ export function AgentFlowsPage({ onExit }: AgentFlowsPageProps = {}) {
     const liveMessageId = createClientID("flow_chat_live");
     const traceId = createClientID("flow_trace");
     let stopFlowTracePolling = () => {};
+    let executedFlow: AgentFlowSpec | null = null;
     try {
       const submittedInput = flowTestInput;
       const saved = await saveFlow();
       if (!saved) return;
+      executedFlow = saved;
+      const sessionId = await ensureFlowDebugSession(saved);
       const userText = submittedInput.trim();
       setFlowTestInput("");
       setFlowTestMessages((current) => [
@@ -740,7 +671,7 @@ export function AgentFlowsPage({ onExit }: AgentFlowsPageProps = {}) {
         }
       ]);
       const input = inputFromDebugText(submittedInput);
-      const initialProgressTrace = buildRuntimeEventsTrace(traceId, flowDebugSessionId, saved.name, []);
+      const initialProgressTrace = buildRuntimeEventsTrace(traceId, sessionId, saved.name, []);
       setFlowTestMessages((current) => [
         ...current,
         {
@@ -757,23 +688,16 @@ export function AgentFlowsPage({ onExit }: AgentFlowsPageProps = {}) {
       if (!workspace.activeBundleId) {
         throw new Error("No active config bundle selected.");
       }
-      const { session } = await debugSessionApi.createSession({
-        bundle_id: workspace.activeBundleId,
-        entrypoint: {
-          kind: "workflow",
-          id: saved.id
-        }
-      });
       const runtimeResult =
         saved.orchestrationMode === "supervisor"
-          ? await debugSessionApi.runAgentGraph(session.id, {
+          ? await debugSessionApi.runAgentGraph(sessionId, {
               agent_flow_id: saved.id,
               input,
               trace_context: {
                 trace_id: traceId
               }
             })
-          : await debugSessionApi.runWorkflow(session.id, {
+          : await debugSessionApi.runWorkflow(sessionId, {
               workflow_id: saved.id,
               input,
               trace_context: {
@@ -781,7 +705,7 @@ export function AgentFlowsPage({ onExit }: AgentFlowsPageProps = {}) {
               }
             });
       const result = agentFlowRunResponseFromRuntime(saved.id, input, runtimeResult, traceId);
-      const trace = await loadRuntimeTraceOrFallback(traceId, result, flowDebugSessionId);
+      const trace = await loadRuntimeTraceOrFallback(traceId, result, sessionId);
       setActiveFlowTrace((current) => (current?.traceId === traceId ? trace : current));
       setFlowTestMessages((current) =>
         [
@@ -810,9 +734,10 @@ export function AgentFlowsPage({ onExit }: AgentFlowsPageProps = {}) {
         ok: result.run.status === "succeeded",
         message: result.error || `Agent Flow run ${result.run.status}.`
       });
+      await refreshFlowTestSessions(saved);
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : "Failed to run Agent Flow.";
-      const failedProgressTrace = buildRuntimeEventsTrace(traceId, flowDebugSessionId, selectedFlow.name, [], errorMessage);
+      const failedProgressTrace = buildRuntimeEventsTrace(traceId, flowDebugSessionId || "new_preview_session", selectedFlow.name, [], errorMessage);
       setActiveFlowTrace((current) => (current?.traceId === traceId ? failedProgressTrace : current));
       setFlowTestMessages((current) =>
         current.some((message) => message.id === liveMessageId)
@@ -822,7 +747,13 @@ export function AgentFlowsPage({ onExit }: AgentFlowsPageProps = {}) {
                     ...message,
                     text: errorMessage,
                     traceId: message.traceId ?? traceId,
-                    trace: buildRuntimeEventsTrace(message.traceId ?? traceId, flowDebugSessionId, selectedFlow.name, message.liveEvents ?? [], errorMessage),
+                    trace: buildRuntimeEventsTrace(
+                      message.traceId ?? traceId,
+                      flowDebugSessionId || "new_preview_session",
+                      selectedFlow.name,
+                      message.liveEvents ?? [],
+                      errorMessage
+                    ),
                     pending: false
                   }
                 : message
@@ -839,10 +770,29 @@ export function AgentFlowsPage({ onExit }: AgentFlowsPageProps = {}) {
               ]
       );
       setNotice({ ok: false, message: errorMessage });
+      if (executedFlow) {
+        await refreshFlowTestSessions(executedFlow);
+      }
     } finally {
       stopFlowTracePolling();
       setIsFlowRunning(false);
     }
+  }
+
+  async function ensureFlowDebugSession(flow: AgentFlowSpec): Promise<string> {
+    if (flowDebugSessionId) return flowDebugSessionId;
+    if (!workspace.activeBundleId) {
+      throw new Error("No active config bundle selected.");
+    }
+    const { session } = await debugSessionApi.createSession({
+      bundle_id: workspace.activeBundleId,
+      entrypoint: {
+        kind: "workflow",
+        id: flow.id
+      }
+    });
+    setFlowDebugSessionId(session.id);
+    return session.id;
   }
 
   function startFlowTracePolling(traceId: string, liveMessageId: string): () => void {
@@ -885,7 +835,7 @@ export function AgentFlowsPage({ onExit }: AgentFlowsPageProps = {}) {
   }
 
   function resetFlowDebugSession() {
-    setFlowDebugSessionId(createClientID("flow_debug_session"));
+    setFlowDebugSessionId("");
     setFlowTestMessages([]);
     setActiveFlowTrace(null);
     setIsFlowTestHistoryOpen(false);
@@ -893,10 +843,6 @@ export function AgentFlowsPage({ onExit }: AgentFlowsPageProps = {}) {
 
   async function restoreFlowDebugSession(session: FlowTestSessionRecord) {
     const restoredMessages = await restoreFlowTestMessages(selectedFlow, session);
-    restoredFlowHistorySnapshotRef.current = {
-      messagesKey: flowTestMessagesKey(restoredMessages),
-      sessionId: session.sessionId
-    };
     setFlowDebugSessionId(session.sessionId);
     setFlowTestMessages(restoredMessages);
     setActiveFlowTrace(null);
@@ -1193,7 +1139,7 @@ export function AgentFlowsPage({ onExit }: AgentFlowsPageProps = {}) {
             <div className="node-inspector-header flow-test-drawer-header">
               <div>
                 <p>
-                  Session <code>{flowDebugSessionId}</code>
+                  Session <code>{flowDebugSessionId || "new_preview_session"}</code>
                 </p>
               </div>
               <div className="node-inspector-actions">
@@ -1831,11 +1777,36 @@ async function recoverFlowTestMessagesFromRunHistory(flow: AgentFlowSpec, sessio
   }
 }
 
+function flowTestSessionFromRunRecords(flow: AgentFlowSpec, flowKey: string, sessionId: string, records: RunRecord[]): FlowTestSessionRecord {
+  const sorted = [...records].sort((left, right) => (left.started_at || "").localeCompare(right.started_at || ""));
+  const messages = completedFlowTestMessagesForHistory(sorted.flatMap((record) => flowTestMessagesFromRunRecord(record)));
+  const first = sorted[0];
+  const last = sorted[sorted.length - 1] ?? first;
+  return {
+    createdAt: first?.started_at ?? "",
+    flowKey,
+    flowName: flow.name || flow.graph.name || "Untitled Agent Flow",
+    messages,
+    sessionId,
+    updatedAt: last?.finished_at ?? last?.started_at ?? ""
+  };
+}
+
+function runRecordMatchesFlow(record: RunRecord, flow: AgentFlowSpec): boolean {
+  if (record.type !== "workflow" && record.type !== "agent_graph") return false;
+  const flowIDs = new Set([flow.id, flow.graph.id].filter(Boolean));
+  if (flowIDs.size === 0) return true;
+  const entrypointID = runRecordFlowID(record);
+  return entrypointID === "" || flowIDs.has(entrypointID);
+}
+
 function runRecordMatchesFlowSession(record: RunRecord, flow: AgentFlowSpec, session: FlowTestSessionRecord): boolean {
   if (record.session_id !== session.sessionId) return false;
-  const flowIDs = new Set([flow.id, flow.graph.id].filter(Boolean));
-  const entrypointID = record.entrypoint?.id || record.workflow_request?.workflow_id;
-  return !entrypointID || flowIDs.size === 0 || flowIDs.has(entrypointID);
+  return runRecordMatchesFlow(record, flow);
+}
+
+function runRecordFlowID(record: RunRecord): string {
+  return record.entrypoint?.id || record.workflow_request?.workflow_id || record.agent_graph_request?.agent_flow_id || "";
 }
 
 function flowTestMessagesFromRunRecord(record: RunRecord): DebugChatMessage[] {
@@ -1863,7 +1834,7 @@ function flowTestMessagesFromRunRecord(record: RunRecord): DebugChatMessage[] {
 function flowUserTextFromRunRecord(record: RunRecord): string {
   const agentMessage = record.agent_request?.user_message?.trim();
   if (agentMessage) return agentMessage;
-  const input = record.workflow_request?.input ?? {};
+  const input = record.workflow_request?.input ?? record.agent_graph_request?.input ?? {};
   for (const key of ["user_request", "message", "text", "query", "task", "prompt"]) {
     const value = stringFromRecord(input, key);
     if (value) return value;

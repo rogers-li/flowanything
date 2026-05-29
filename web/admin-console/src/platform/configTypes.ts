@@ -487,6 +487,7 @@ export type DebugSessionSnapshot = {
   version?: string;
   entrypoint?: BundleEntrypoint;
   created_at?: string;
+  last_used_at?: string;
   updated_at?: string;
 };
 
@@ -502,7 +503,7 @@ export type CreateDebugSessionResponse = {
 
 export type RunRecord = {
   id: string;
-  type: "agent" | "workflow";
+  type: "agent" | "workflow" | "agent_graph";
   status: "succeeded" | "failed";
   session_id?: string;
   trace_id?: string;
@@ -516,9 +517,14 @@ export type RunRecord = {
     agent_id?: string;
     user_message?: string;
     trace_id?: string;
+    trace_context?: TraceContext;
   };
   workflow_request?: {
     workflow_id?: string;
+    input?: JsonObject;
+  };
+  agent_graph_request?: {
+    agent_flow_id?: string;
     input?: JsonObject;
   };
   result?: unknown;

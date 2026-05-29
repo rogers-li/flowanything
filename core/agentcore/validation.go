@@ -1,10 +1,10 @@
 package agentcore
 
 import (
-	"encoding/json"
 	"fmt"
 	"strings"
 
+	"flow-anything/core/jsonutil"
 	"flow-anything/core/schema"
 )
 
@@ -73,13 +73,8 @@ func finalTextFromOutput(content string, output map[string]any) string {
 }
 
 func parseJSONObject(content string) (map[string]any, error) {
-	content = strings.TrimSpace(content)
-	content = strings.TrimPrefix(content, "```json")
-	content = strings.TrimPrefix(content, "```")
-	content = strings.TrimSuffix(content, "```")
-	content = strings.TrimSpace(content)
 	var output map[string]any
-	if err := json.Unmarshal([]byte(content), &output); err != nil {
+	if err := jsonutil.UnmarshalObject(content, &output); err != nil {
 		return nil, err
 	}
 	if output == nil {

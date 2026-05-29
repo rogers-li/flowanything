@@ -516,6 +516,75 @@ func TestReActStrategyLoopsThroughObservationBeforeFinalAnswer(t *testing.T) {
 	}
 }
 
+func TestReActStrategyUsesDistinctSpansForRepeatedCapabilityInSameIteration(t *testing.T) {
+	model := &fakeModel{responses: []string{
+		`{"actions":[{"type":"tool","id":"tool_search","task":"search Anthropic","input":{"query":"Anthropic"},"reason":"needed"},{"type":"tool","id":"tool_search","task":"search Google I/O","input":{"query":"Google I/O"},"reason":"needed"}]}`,
+		`{"actions":[],"final_answer_if_no_action":"Combined summary."}`,
+	}}
+	capabilities := NewMapCapabilityRegistry()
+	var spanIDs []string
+	if err := capabilities.Register(CapabilityFunc{
+		Desc: CapabilityDescriptor{
+			ID:          "tool_search",
+			Type:        "tool",
+			Name:        "Search Tool",
+			Description: "Search web.",
+			InputSchema: []SchemaField{{
+				Name:     "query",
+				Type:     "string",
+				Required: true,
+			}},
+		},
+		Fn: func(_ Context, call CapabilityCall) (CapabilityResult, error) {
+			spanIDs = append(spanIDs, call.TraceContext.SpanID)
+			return CapabilityResult{
+				ID:     call.ID,
+				Type:   call.Type,
+				Text:   "ok",
+				Output: map[string]any{"query": call.Input["query"]},
+			}, nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := NewRunner(model, WithCapabilities(capabilities))
+	result, err := runner.Run(context.Background(), AgentRunRequest{
+		TraceID:     "trace_react_repeated_capability",
+		UserMessage: "Compare Anthropic and Google I/O",
+		Agent: AgentSpec{
+			ID:            "agent_research",
+			Prompt:        "You research topics.",
+			ReasoningMode: "react",
+			Model:         ModelConfig{Provider: "fake", Model: "fake-model"},
+			Capabilities: []CapabilityDescriptor{{
+				ID:          "tool_search",
+				Type:        "tool",
+				Name:        "Search Tool",
+				Description: "Search web.",
+				InputSchema: []SchemaField{{
+					Name:     "query",
+					Type:     "string",
+					Required: true,
+				}},
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Text != "Combined summary." {
+		t.Fatalf("unexpected react answer: %q", result.Text)
+	}
+	expected := []string{
+		runtimecontext.AgentCapabilitySpanID("trace_react_repeated_capability", "agent_research", "tool", "tool_search@1.1"),
+		runtimecontext.AgentCapabilitySpanID("trace_react_repeated_capability", "agent_research", "tool", "tool_search@1.2"),
+	}
+	if strings.Join(spanIDs, "\n") != strings.Join(expected, "\n") {
+		t.Fatalf("unexpected capability spans:\n%v", spanIDs)
+	}
+}
+
 func TestReActStrategyStopsRepeatedActionLoop(t *testing.T) {
 	model := &fakeModel{responses: []string{
 		`{"actions":[{"type":"tool","id":"tool_search","task":"search AI news","input":{"query":"AI news"},"reason":"need fresh information"}]}`,
@@ -766,6 +835,118 @@ func TestStructuredFinalOutputUsesTextFieldAsResultText(t *testing.T) {
 	}
 }
 
+func TestReActFinalAnswerPromptRequiresStructuredOutput(t *testing.T) {
+	model := &fakeModel{responses: []string{
+		`{"actions":[{"type":"agent","id":"agent_news","task":"search AI news","input":{},"reason":"route to news agent"}]}`,
+		`{"text":"交给 News Agent 继续处理。","next_node_ids":["agent_news"]}`,
+	}}
+	runner := NewRunner(model)
+
+	result, err := runner.Run(context.Background(), AgentRunRequest{
+		TraceID:     "trace_react_structured_output",
+		UserMessage: "搜索今天的 AI 新闻",
+		Agent: AgentSpec{
+			ID:            "agent_router",
+			Prompt:        "Route the request to the next node.",
+			ReasoningMode: "react",
+			Model:         ModelConfig{Provider: "fake", Model: "fake-model"},
+			OutputSchema: []SchemaField{
+				{Name: "text", Type: "string", Required: true},
+				{Name: "next_node_ids", Type: "array", Required: true},
+			},
+			Policy: AgentPolicy{ValidateFinalOutput: true, MaxIterations: 1},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Text != "交给 News Agent 继续处理。" {
+		t.Fatalf("expected structured text result, got %q", result.Text)
+	}
+	if len(model.requests) != 2 {
+		t.Fatalf("expected planning and final answer requests, got %d", len(model.requests))
+	}
+	finalSystemPrompt := model.requests[1].Messages[0].Content
+	for _, expected := range []string{
+		"Return exactly one valid JSON object and nothing else.",
+		"@agent(...)",
+		"$.next_node_ids",
+	} {
+		if !strings.Contains(finalSystemPrompt, expected) {
+			t.Fatalf("final answer prompt missing %q:\n%s", expected, finalSystemPrompt)
+		}
+	}
+}
+
+func TestReActPlanningExtractsJSONPlanFromPrefixedModelText(t *testing.T) {
+	model := &fakeModel{responses: []string{
+		`我会先调用搜索工具。{"actions":[{"type":"tool","id":"tool_search","task":"search fresh AI news","input":{"query":"2026 AI news"},"reason":"need current information"}]}`,
+		`{"text":"搜索完成。"}`,
+	}}
+	calls := 0
+	capabilities := NewMapCapabilityRegistry()
+	if err := capabilities.Register(CapabilityFunc{
+		Desc: CapabilityDescriptor{
+			ID:          "tool_search",
+			Type:        "tool",
+			Name:        "Search",
+			Description: "Search web.",
+			InputSchema: []SchemaField{{
+				Name:     "query",
+				Type:     "string",
+				Required: true,
+			}},
+		},
+		Fn: func(_ Context, call CapabilityCall) (CapabilityResult, error) {
+			calls++
+			if call.Input["query"] != "2026 AI news" {
+				t.Fatalf("unexpected query input: %#v", call.Input)
+			}
+			return CapabilityResult{ID: call.ID, Type: call.Type, Text: "ok"}, nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runner := NewRunner(model, WithCapabilities(capabilities))
+
+	result, err := runner.Run(context.Background(), AgentRunRequest{
+		TraceID:     "trace_prefixed_plan",
+		UserMessage: "搜索 2026 AI 新闻",
+		Agent: AgentSpec{
+			ID:            "agent_search",
+			Prompt:        "Use search when fresh information is needed.",
+			ReasoningMode: "react",
+			Model:         ModelConfig{Provider: "fake", Model: "fake-model"},
+			Capabilities: []CapabilityDescriptor{{
+				ID:          "tool_search",
+				Type:        "tool",
+				Name:        "Search",
+				Description: "Search web.",
+				InputSchema: []SchemaField{{
+					Name:     "query",
+					Type:     "string",
+					Required: true,
+				}},
+			}},
+			OutputSchema: []SchemaField{{
+				Name:     "text",
+				Type:     "string",
+				Required: true,
+			}},
+			Policy: AgentPolicy{ValidateFinalOutput: true, MaxIterations: 1},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected one capability call, got %d", calls)
+	}
+	if result.Text != "搜索完成。" {
+		t.Fatalf("unexpected result text: %q", result.Text)
+	}
+}
+
 func TestActionPlanningValidatesCapabilityInputSchema(t *testing.T) {
 	model := &fakeModel{responses: []string{
 		`{"actions":[{"type":"tool","id":"tool_weather","task":"query weather","input":{},"reason":"user asked weather"}]}`,
@@ -855,6 +1036,41 @@ func TestDirectStrategyValidatesStructuredFinalOutputWhenEnabled(t *testing.T) {
 	}
 	if result.Output["text"] != "hello" {
 		t.Fatalf("expected parsed structured output, got %#v", result.Output)
+	}
+	if len(model.requests) != 1 || len(model.requests[0].Messages) == 0 {
+		t.Fatalf("expected direct model request to be captured")
+	}
+	systemPrompt := model.requests[0].Messages[0].Content
+	if !strings.Contains(systemPrompt, "Return exactly one valid JSON object and nothing else.") {
+		t.Fatalf("direct strategy should instruct structured final output, got:\n%s", systemPrompt)
+	}
+}
+
+func TestDirectStrategyExtractsStructuredFinalOutputFromPrefixedText(t *testing.T) {
+	model := &fakeModel{responses: []string{`好的，结果如下：{"text":"hello"}`}}
+	runner := NewRunner(model)
+
+	result, err := runner.Run(context.Background(), AgentRunRequest{
+		TraceID:     "trace_output_prefix",
+		UserMessage: "hi",
+		Agent: AgentSpec{
+			ID:            "agent_structured",
+			Prompt:        "Return JSON.",
+			ReasoningMode: "direct",
+			Model:         ModelConfig{Provider: "fake", Model: "fake-model"},
+			OutputSchema: []SchemaField{{
+				Name:     "text",
+				Type:     "string",
+				Required: true,
+			}},
+			Policy: AgentPolicy{ValidateFinalOutput: true},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Text != "hello" {
+		t.Fatalf("expected extracted structured output text, got %q", result.Text)
 	}
 }
 

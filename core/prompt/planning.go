@@ -29,7 +29,7 @@ func BuildPlanningSystemPrompt(req PlanningPromptRequest) string {
 	}
 	builder.WriteString("Runtime Action Planning Contract:\n")
 	builder.WriteString("基于当前 Agent 的提示词、用户请求和可用能力，规划下一步要执行的 action list。Tools、Skills、Agents、Workflows 都是同一类可调用 action；只有当需要它们时才放入 actions。\n")
-	builder.WriteString("Return JSON only, with no markdown.\n")
+	builder.WriteString("Return exactly one valid JSON object and nothing else. The response must start with { and end with }. Do not add markdown fences, explanations, or natural-language prefixes.\n")
 	builder.WriteString(`Schema: {"actions":[{"type":"tool|skill|agent|workflow|knowledge","id":"...","task":"specific task","input":{},"reason":"why this action is needed"}],"final_answer_if_no_action":"optional final answer"}`)
 	builder.WriteString("\nConstraints:\n")
 	builder.WriteString("- Select only from the available capabilities below.\n")
@@ -52,9 +52,11 @@ func BuildFinalAnswerSystemPrompt(base Spec, outputSchema schema.Schema) string 
 	if builder.Len() > 0 {
 		builder.WriteString("\n\n")
 	}
-	builder.WriteString("Use the observations to answer the user naturally and accurately.")
+	builder.WriteString("Answer the user naturally and accurately. Use observations when they are available.")
 	if len(outputSchema) > 0 {
-		builder.WriteString("\nIf structured output is required, follow this schema:\n")
+		builder.WriteString("\n\nStructured output is required.\n")
+		builder.WriteString("Return exactly one valid JSON object and nothing else. Do not use markdown fences, natural-language prefixes, or @agent(...) mentions.\n")
+		builder.WriteString("The JSON object must match this schema:\n")
 		builder.WriteString(schema.Describe(outputSchema))
 	}
 	return strings.TrimSpace(builder.String())

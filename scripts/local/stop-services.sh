@@ -4,6 +4,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 RUNTIME_DIR="${FLOW_ANYTHING_RUNTIME_DIR:-$ROOT_DIR/.runtime/local}"
 PID_FILE="$RUNTIME_DIR/services.pid"
+FRONTEND_PID_FILE="$RUNTIME_DIR/admin-console.pid"
+FRONTEND_ENABLED="${FLOW_ANYTHING_STOP_FRONTEND:-true}"
 TIMEOUT_SECONDS="${FLOW_ANYTHING_STOP_TIMEOUT_SECONDS:-10}"
 
 pid_is_running() {
@@ -35,7 +37,31 @@ stop_pid() {
   fi
 }
 
+stop_frontend() {
+  if [[ "$FRONTEND_ENABLED" != "true" ]]; then
+    echo "skip admin-console frontend stop, FLOW_ANYTHING_STOP_FRONTEND=$FRONTEND_ENABLED"
+    return
+  fi
+  if [[ ! -f "$FRONTEND_PID_FILE" ]]; then
+    echo "skip admin-console frontend stop, pid file not found"
+    return
+  fi
+
+  local pid
+  pid="$(cat "$FRONTEND_PID_FILE")"
+  if ! pid_is_running "$pid"; then
+    echo "skip admin-console frontend stop, pid $pid is not running"
+    : > "$FRONTEND_PID_FILE"
+    return
+  fi
+
+  stop_pid "admin-console frontend" "$pid"
+  : > "$FRONTEND_PID_FILE"
+}
+
 main() {
+  stop_frontend
+
   if [[ ! -f "$PID_FILE" ]]; then
     echo "pid file not found: $PID_FILE"
     echo "nothing to stop"

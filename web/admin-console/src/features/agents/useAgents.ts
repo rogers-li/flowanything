@@ -98,11 +98,7 @@ export function useAgents() {
   async function loadDebugHistory(agentId: string) {
     try {
       const response = await runHistoryApi.list();
-      setDebugSessions(
-        response.items
-          .filter((record) => record.type === "agent" && record.agent_request?.agent_id === agentId)
-          .map(debugSessionRecordFromRun)
-      );
+      setDebugSessions(agentDebugSessionRecordsFromRuns(response.items, agentId));
     } catch {
       setDebugSessions([]);
     }
@@ -415,33 +411,61 @@ function runtimeEventsFromTrace(trace: AgentTrace): RuntimeEvent[] {
   }));
 }
 
-function debugSessionRecordFromRun(record: RunRecord): AgentDebugSessionRecord {
+function agentDebugSessionRecordsFromRuns(records: RunRecord[], agentId: string): AgentDebugSessionRecord[] {
+  const grouped = new Map<string, RunRecord[]>();
+  records
+    .filter((record) => record.type === "agent" && record.agent_request?.agent_id === agentId)
+    .forEach((record) => {
+      const sessionKey = record.session_id || record.id;
+      grouped.set(sessionKey, [...(grouped.get(sessionKey) ?? []), record]);
+    });
+
+  return Array.from(grouped.entries())
+    .map(([sessionId, sessionRuns]) => debugSessionRecordFromRuns(sessionId, sessionRuns))
+    .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+}
+
+function debugSessionRecordFromRuns(sessionId: string, records: RunRecord[]): AgentDebugSessionRecord {
+  const sorted = [...records].sort((left, right) => (left.started_at || "").localeCompare(right.started_at || ""));
+  const messages = sorted.flatMap(debugMessagesFromRun);
+  const first = sorted[0];
+  const last = sorted[sorted.length - 1] ?? first;
+  return {
+    agentId: first?.agent_request?.agent_id ?? first?.entrypoint?.id ?? "",
+    agentName: first?.entrypoint?.id ?? "Agent",
+    createdAt: first?.started_at ?? "",
+    messages,
+    sessionId,
+    updatedAt: last?.finished_at ?? last?.started_at ?? ""
+  };
+}
+
+function debugMessagesFromRun(record: RunRecord): DebugChatMessage[] {
   const userText = record.agent_request?.user_message ?? "";
   const assistantText = resultText(record.result) || record.error || "";
-  const messages: DebugChatMessage[] = [
-    {
+  const traceId = traceIdFromRun(record);
+  const messages: DebugChatMessage[] = [];
+  if (userText) {
+    messages.push({
       id: `${record.id}_user`,
       role: "user",
       text: userText
-    }
-  ];
+    });
+  }
   if (assistantText) {
     messages.push({
       id: `${record.id}_assistant`,
       role: "assistant",
       text: assistantText,
-      traceId: record.trace_id,
+      traceId,
       pending: false
     });
   }
-  return {
-    agentId: record.agent_request?.agent_id ?? record.entrypoint?.id ?? "",
-    agentName: record.entrypoint?.id ?? "Agent",
-    createdAt: record.started_at ?? "",
-    messages,
-    sessionId: record.session_id ?? "",
-    updatedAt: record.finished_at ?? record.started_at ?? ""
-  };
+  return messages;
+}
+
+function traceIdFromRun(record: RunRecord): string | undefined {
+  return record.trace_id || record.agent_request?.trace_id || record.agent_request?.trace_context?.trace_id;
 }
 
 function resultText(result: unknown): string {

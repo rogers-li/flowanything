@@ -20,10 +20,8 @@ npm run dev
 
 The Vite dev server proxies:
 
-- `/platform-api` -> `http://localhost:8080`
-- `/agent-runtime` -> `http://localhost:8082`
-- `/model-gateway` -> `http://localhost:8085`
+- `/ai-platform-runtime` -> `http://localhost:8081`
 
 ## Current Scope
 
-This is a front-end framework skeleton. It uses realistic mock data to validate information architecture before all back-end management APIs are available.
+This console edits config-as-code resources and talks to the rebuilt unified AI platform runtime.

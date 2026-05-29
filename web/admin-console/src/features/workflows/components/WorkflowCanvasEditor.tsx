@@ -2028,37 +2028,68 @@ function WorkflowNodeConfigModal({
 }
 
 function ContextFieldRows({ fields, onChange }: { fields: ContextFieldDraft[]; onChange: (fields: ContextFieldDraft[]) => void }) {
+  const [editingRows, setEditingRows] = useState<Record<string, boolean>>({});
   const update = (fieldId: string, patch: Partial<ContextFieldDraft>) => {
     onChange(fields.map((field) => (field.id === fieldId ? { ...field, ...patch } : field)));
   };
+  const addField = () => {
+    const field = createContextField();
+    onChange([...fields, field]);
+    setEditingRows((current) => ({ ...current, [field.id]: true }));
+  };
   return (
     <div className="workflow-context-field-block">
-      <div className="workflow-context-table">
-        <span>Path</span>
-        <span>Type</span>
-        <span>Req</span>
-        <span>Description</span>
-        <span />
-        {fields.map((field) => (
-          <div className="workflow-table-row" key={field.id}>
-            <input value={field.path} onChange={(event) => update(field.id, { path: event.target.value })} placeholder="request.query" />
-            <select value={field.type} onChange={(event) => update(field.id, { type: event.target.value })}>
-              <option value="string">string</option>
-              <option value="number">number</option>
-              <option value="integer">integer</option>
-              <option value="boolean">boolean</option>
-              <option value="object">object</option>
-              <option value="array">array</option>
-            </select>
-            <input type="checkbox" checked={field.required} onChange={(event) => update(field.id, { required: event.target.checked })} />
-            <input value={field.description} onChange={(event) => update(field.id, { description: event.target.value })} placeholder="Explain this context field" />
-            <button type="button" onClick={() => onChange(fields.filter((item) => item.id !== field.id))} aria-label="Remove context field">
-              ×
-            </button>
-          </div>
-        ))}
-      </div>
-      <button className="secondary-action" type="button" onClick={() => onChange([...fields, createContextField()])}>
+      {fields.length > 0 ? (
+        <div className="workflow-context-compact-table">
+          <span>Path</span>
+          <span>Type</span>
+          <span>Req</span>
+          <span>Description</span>
+          <span />
+          {fields.map((field) => (
+            <div className="workflow-context-compact-row" key={field.id}>
+              {editingRows[field.id] ? (
+                <>
+                  <input value={field.path} onChange={(event) => update(field.id, { path: event.target.value })} placeholder="request.query" />
+                  <select value={field.type} onChange={(event) => update(field.id, { type: event.target.value })}>
+                    <option value="string">string</option>
+                    <option value="number">number</option>
+                    <option value="integer">integer</option>
+                    <option value="boolean">boolean</option>
+                    <option value="object">object</option>
+                    <option value="array">array</option>
+                  </select>
+                  <label className="workflow-context-compact-required">
+                    <input type="checkbox" checked={field.required} onChange={(event) => update(field.id, { required: event.target.checked })} />
+                  </label>
+                  <input value={field.description} onChange={(event) => update(field.id, { description: event.target.value })} placeholder="Explain this context field" />
+                  <span className="workflow-context-compact-actions">
+                    <button type="button" onClick={() => setEditingRows((current) => ({ ...current, [field.id]: false }))}>
+                      Done
+                    </button>
+                    <button type="button" onClick={() => onChange(fields.filter((item) => item.id !== field.id))} aria-label="Remove context field">
+                      ×
+                    </button>
+                  </span>
+                </>
+              ) : (
+                <>
+                  <strong>{field.path || "(unnamed)"}</strong>
+                  <code>{field.type}</code>
+                  <span>{field.required ? "required" : "optional"}</span>
+                  <em>{field.description || "No description"}</em>
+                  <button type="button" title="Edit field" aria-label={`Edit ${field.path || "context field"}`} onClick={() => setEditingRows((current) => ({ ...current, [field.id]: true }))}>
+                    ✎
+                  </button>
+                </>
+              )}
+            </div>
+          ))}
+        </div>
+      ) : (
+        <p className="schema-empty-state">No context fields yet.</p>
+      )}
+      <button className="secondary-action" type="button" onClick={addField}>
         + Field
       </button>
     </div>

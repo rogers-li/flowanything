@@ -51,3 +51,26 @@ func TestParseActionPlanStripsMarkdownFence(t *testing.T) {
 		t.Fatal("expected reason")
 	}
 }
+
+func TestParseActionPlanExtractsPrefixedJSON(t *testing.T) {
+	plan, err := ParseActionPlan(`明白了，我会调用搜索工具。{"actions":[{"type":"tool","id":"tool_search","task":"search 2026 AI news","input":{"query":"2026 AI news"},"reason":"needs fresh info"}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Actions) != 1 || plan.Actions[0].ID != "tool_search" {
+		t.Fatalf("unexpected plan: %#v", plan)
+	}
+	if plan.Actions[0].Input["query"] != "2026 AI news" {
+		t.Fatalf("unexpected action input: %#v", plan.Actions[0].Input)
+	}
+}
+
+func TestParseActionPlanAcceptsStructuredFinalAnswerObject(t *testing.T) {
+	plan, err := ParseActionPlan(`{"actions":[],"final_answer_if_no_action":{"text":"done"}}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.FinalAnswerIfNoAction != `{"text":"done"}` {
+		t.Fatalf("unexpected final answer: %q", plan.FinalAnswerIfNoAction)
+	}
+}

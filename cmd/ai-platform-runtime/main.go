@@ -7,7 +7,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"flow-anything/internal_new/bootstrap"
+	"flow-anything/internal/bootstrap"
 )
 
 func main() {

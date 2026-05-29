@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Badge } from "../components/Badge";
 import { PageHeader } from "../components/PageHeader";
-import { SchemaFieldTable } from "../features/connectors/components/SchemaFieldTable";
+import { SchemaFieldTable, SchemaFieldViewer } from "../features/connectors/components/SchemaFieldTable";
 import { createHeader, createSchemaField, type HeaderDraft, type SchemaFieldDraft } from "../features/connectors/domain";
 import { WorkflowCanvasEditor } from "../features/workflows/components/WorkflowCanvasEditor";
 import { createWorkflowDraft, workflowFromDraft } from "../features/workflows/domain";
@@ -1790,11 +1790,11 @@ function MCPToolInspector({ onClose, tool }: { onClose: () => void; tool: ToolSp
       </section>
       <section>
         <h3>Input Params</h3>
-        <SchemaFieldReadOnlyList fields={inputFields} emptyText="No input parameters." />
+        <SchemaFieldViewer fields={inputFields} emptyText="No input parameters." />
       </section>
       <section>
         <h3>Output Schema</h3>
-        <SchemaFieldReadOnlyList fields={outputFields} emptyText="No output fields." />
+        <SchemaFieldViewer fields={outputFields} emptyText="No output fields." />
       </section>
       <section className="mcp-inspector-meta">
         <div>

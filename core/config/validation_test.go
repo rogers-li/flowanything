@@ -55,6 +55,100 @@ func TestValidateBundleRejectsDuplicateIDs(t *testing.T) {
 	}
 }
 
+func TestValidateBundleAcceptsWorkflowAgentSkillCapability(t *testing.T) {
+	bundle := validBundle()
+	bundle.Resources.Workflows = append(bundle.Resources.Workflows, WorkflowConfig{
+		ResourceMeta: ResourceMeta{ID: "workflow_agent_graph", Name: "Agent Graph"},
+		Spec: flowengine.FlowSpec{
+			ID: "workflow_agent_graph",
+			Nodes: []flowengine.NodeSpec{{
+				ID:   "agent_search_node",
+				Type: "workflow.agent",
+				Config: map[string]any{
+					"agent": map[string]any{
+						"id":   "agent_local_search",
+						"name": "Local Search Agent",
+						"capabilities": []any{map[string]any{
+							"id":   "skill_search",
+							"type": "skill",
+							"name": "Search Skill",
+						}},
+					},
+				},
+			}},
+		},
+	})
+
+	if err := ValidateBundle(bundle); err != nil {
+		t.Fatalf("expected workflow agent skill capability to be valid: %v", err)
+	}
+}
+
+func TestValidateBundleRejectsWorkflowAgentSkillToolLeakage(t *testing.T) {
+	bundle := validBundle()
+	bundle.Resources.Workflows = append(bundle.Resources.Workflows, WorkflowConfig{
+		ResourceMeta: ResourceMeta{ID: "workflow_leaky_agent", Name: "Leaky Agent Graph"},
+		Spec: flowengine.FlowSpec{
+			ID: "workflow_leaky_agent",
+			Nodes: []flowengine.NodeSpec{{
+				ID:   "agent_search_node",
+				Type: "workflow.agent",
+				Config: map[string]any{
+					"agent": map[string]any{
+						"id":   "agent_local_search",
+						"name": "Local Search Agent",
+						"capabilities": []any{
+							map[string]any{"id": "skill_search", "type": "skill", "name": "Search Skill"},
+							map[string]any{"id": "tool_search", "type": "tool", "name": "Search Tool"},
+						},
+					},
+				},
+			}},
+		},
+	})
+
+	err := ValidateBundle(bundle)
+	if err == nil {
+		t.Fatal("expected workflow agent capability leakage to be rejected")
+	}
+	if !strings.Contains(err.Error(), `tool capability "tool_search" is owned by skill capability "skill_search"`) {
+		t.Fatalf("unexpected validation error: %v", err)
+	}
+}
+
+func TestValidateBundleRejectsUnknownWorkflowAgentCapability(t *testing.T) {
+	bundle := validBundle()
+	bundle.Resources.Workflows = append(bundle.Resources.Workflows, WorkflowConfig{
+		ResourceMeta: ResourceMeta{ID: "workflow_missing_capability", Name: "Missing Capability Graph"},
+		Spec: flowengine.FlowSpec{
+			ID: "workflow_missing_capability",
+			Nodes: []flowengine.NodeSpec{{
+				ID:   "agent_search_node",
+				Type: "workflow.agent",
+				Config: map[string]any{
+					"agent": map[string]any{
+						"id":   "agent_local_search",
+						"name": "Local Search Agent",
+						"capabilities": []any{map[string]any{
+							"id":   "tool_missing",
+							"type": "tool",
+							"name": "Missing Tool",
+						}},
+					},
+				},
+			}},
+		},
+	})
+
+	err := ValidateBundle(bundle)
+	if err == nil {
+		t.Fatal("expected missing workflow agent capability to be rejected")
+	}
+	if !strings.Contains(err.Error(), `referenced tool "tool_missing" does not exist`) {
+		t.Fatalf("unexpected validation error: %v", err)
+	}
+}
+
 func TestCheckRuntimeCompatibility(t *testing.T) {
 	bundle := validBundle()
 	bundle.Runtime.Targets = []RuntimeTarget{RuntimeServer, RuntimeMobile}

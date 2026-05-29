@@ -44,6 +44,27 @@ func TestBuildPlanningSystemPromptIncludesCapabilitiesAndSchemas(t *testing.T) {
 	}
 }
 
+func TestBuildFinalAnswerSystemPromptRequiresJSONWhenSchemaExists(t *testing.T) {
+	text := BuildFinalAnswerSystemPrompt(Spec{System: "You route requests."}, schema.Schema{{
+		Name:        "next_node_ids",
+		Type:        schema.TypeArray,
+		Required:    true,
+		Description: "Next nodes.",
+	}})
+
+	for _, expected := range []string{
+		"Structured output is required.",
+		"Return exactly one valid JSON object and nothing else.",
+		"Do not use markdown fences",
+		"@agent(...)",
+		"$.next_node_ids",
+	} {
+		if !strings.Contains(text, expected) {
+			t.Fatalf("final answer prompt missing %q:\n%s", expected, text)
+		}
+	}
+}
+
 func TestRenderTemplateReplacesVariablesDeterministically(t *testing.T) {
 	text := RenderTemplate("Hello {{name}}, run {{task}}.", map[string]any{
 		"task": "search",

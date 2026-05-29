@@ -20,7 +20,11 @@ func (DirectStrategy) Run(ctx Context, runtime StrategyRuntime, req AgentRunRequ
 		ParentSpanID:  req.TraceContext.SpanID,
 		CorrelationID: req.TraceContext.CorrelationID,
 	}
-	messages, err := assembleContextMessages(ctx, runtime, req, DirectStrategy{}.Name(), ContextPhaseDirect, req.Agent.Prompt, nil, nil)
+	systemPrompt := req.Agent.Prompt
+	if len(req.Agent.OutputSchema) > 0 && req.Agent.Policy.ValidateFinalOutput {
+		systemPrompt = buildFinalAnswerPrompt(req.Agent)
+	}
+	messages, err := assembleContextMessages(ctx, runtime, req, DirectStrategy{}.Name(), ContextPhaseDirect, systemPrompt, nil, nil)
 	if err != nil {
 		return AgentRunResult{}, err
 	}

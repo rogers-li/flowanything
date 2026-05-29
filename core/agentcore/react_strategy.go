@@ -125,13 +125,17 @@ func (ReActStrategy) Run(ctx Context, runtime StrategyRuntime, req AgentRunReque
 			break
 		}
 
+		spanKeyCounts := plannedActionSpanKeyCounts(nextActions)
+		spanKeyOccurrences := map[string]int{}
 		for _, action := range nextActions {
 			if len(actionResults) >= policy.MaxActions {
 				actionResults = append(actionResults, ActionResult{Action: action, Error: "max actions reached"})
 				break
 			}
 			attemptedActionFingerprints[plannedActionFingerprint(action)] = struct{}{}
-			result := invokePlannedAction(ctx, runtime, req, action, iteration)
+			spanKey := plannedActionSpanKey(action)
+			spanKeyOccurrences[spanKey]++
+			result := invokePlannedAction(ctx, runtime, req, action, iteration, plannedActionIterationSpanID(action, iteration, spanKeyCounts[spanKey], spanKeyOccurrences[spanKey]))
 			actionResults = append(actionResults, result)
 		}
 		if len(actionResults) >= policy.MaxActions {
@@ -140,6 +144,25 @@ func (ReActStrategy) Run(ctx Context, runtime StrategyRuntime, req AgentRunReque
 	}
 
 	return finalizeFromObservations(ctx, runtime, req, actionResults)
+}
+
+func plannedActionSpanKeyCounts(actions []PlannedAction) map[string]int {
+	counts := map[string]int{}
+	for _, action := range actions {
+		counts[plannedActionSpanKey(action)]++
+	}
+	return counts
+}
+
+func plannedActionSpanKey(action PlannedAction) string {
+	return fmt.Sprintf("%s|%s", strings.ToLower(action.Type), action.ID)
+}
+
+func plannedActionIterationSpanID(action PlannedAction, iteration int, sameCapabilityCount int, occurrence int) string {
+	if sameCapabilityCount > 1 {
+		return fmt.Sprintf("%s@%d.%d", action.ID, iteration, occurrence)
+	}
+	return fmt.Sprintf("%s@%d", action.ID, iteration)
 }
 
 func filterRepeatedActions(actions []PlannedAction, attempted map[string]struct{}) ([]PlannedAction, []PlannedAction) {
@@ -177,10 +200,10 @@ func plannedActionFingerprint(action PlannedAction) string {
 	return fmt.Sprintf("%s|%s|%s|%s", actionType, action.ID, action.Task, string(inputBytes))
 }
 
-func invokePlannedAction(ctx Context, runtime StrategyRuntime, req AgentRunRequest, action PlannedAction, iteration int) ActionResult {
+func invokePlannedAction(ctx Context, runtime StrategyRuntime, req AgentRunRequest, action PlannedAction, iteration int, actionSpanID string) ActionResult {
 	capabilityTrace := runtimecontext.TraceContext{
 		TraceID:       req.TraceID,
-		SpanID:        runtimecontext.AgentCapabilitySpanID(req.TraceID, req.Agent.ID, action.Type, fmt.Sprintf("%s@%d", action.ID, iteration)),
+		SpanID:        runtimecontext.AgentCapabilitySpanID(req.TraceID, req.Agent.ID, action.Type, actionSpanID),
 		ParentSpanID:  req.TraceContext.SpanID,
 		CorrelationID: req.TraceContext.CorrelationID,
 	}
